@@ -14,13 +14,16 @@ from astropy.wcs import WCS, FITSFixedWarning
 from reproject import reproject_interp
 
 from . import config
+from . import s3reader
 from .irsa import Exposure
 
 logging.getLogger("astropy").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=FITSFixedWarning)
 
-_client = httpx.Client(timeout=120, follow_redirects=True,
+_client = httpx.Client(timeout=120, follow_redirects=True, headers=config.IRSA_HEADERS,
                        limits=httpx.Limits(max_connections=config.FETCH_WORKERS * 2))
+_s3 = httpx.Client(timeout=60, limits=httpx.Limits(max_connections=config.FETCH_WORKERS * 2,
+                                                   max_keepalive_connections=config.FETCH_WORKERS * 2))
 
 
 def make_grid(ra: float, dec: float, fov_deg: float) -> tuple[WCS, int]:
@@ -67,59 +70,96 @@ def _flag_names(flags_header, value: int) -> list[str]:
     return out
 
 
+def _load_s3(exp: Exposure, ra: float, dec: float, size: float) -> dict:
+    """Fast path: only the needed IMAGE/FLAGS rows straight from the public S3 bucket."""
+    key = exp.uri.split("spherex/", 1)[1]
+    s = s3reader.read_section(_s3, key, ra, dec, size)
+    hdr, img = s["header"], s["image"]
+    h, w = img.shape
+    return {
+        "hdr": hdr, "img": img, "flags": s["flags"], "fhdr": s["flags_header"],
+        "var": None, "zodi": None,
+        "wcs": WCS(hdr)[s["y0"]:s["y0"] + h, s["x0"]:s["x0"] + w],
+        "spec": (s["wcs_wave_hdul"], s["x0"], s["y0"]),  # spectral WCS uses full-frame pixels
+        "version": str(s["primary_header"].get("VERSION", "")).strip(),
+    }
+
+
+def _load_irsa(exp: Exposure, ra: float, dec: float, size: float) -> dict:
+    """Fallback: IRSA cutout service (~4 MB per request, slower)."""
+    with fetch_cutout(exp, ra, dec, size) as h:
+        hdr = h["IMAGE"].header
+        return {
+            "hdr": hdr, "img": h["IMAGE"].data.astype(np.float32), "flags": h["FLAGS"].data,
+            "fhdr": h["FLAGS"].header, "var": h["VARIANCE"].data.astype(np.float32),
+            "zodi": h["ZODI"].data.astype(np.float32), "wcs": WCS(hdr),
+            "spec": (fits.HDUList([fits.PrimaryHDU(), h["WCS-WAVE"].copy()]), 0, 0),
+            "version": str(h[0].header.get("VERSION", "")).strip(),
+        }
+
+
 def process_exposure(exp: Exposure, ra: float, dec: float, fov_deg: float,
                      grid: WCS, n: int) -> dict:
     """Returns {'image','variance' (n x n float32 on grid), 'meta' (dict)}."""
     # Grid rotation relative to the detector means corners need ~sqrt(2) margin.
     size = fov_deg * 1.45 + 0.01
-    with fetch_cutout(exp, ra, dec, size) as h:
-        hdr = h["IMAGE"].header
-        img = h["IMAGE"].data.astype(np.float32)
-        var = h["VARIANCE"].data.astype(np.float32)
-        zodi = h["ZODI"].data.astype(np.float32)
-        flags = h["FLAGS"].data
-        fhdr = h["FLAGS"].header
+    try:
+        d = _load_s3(exp, ra, dec, size)
+        source = "s3"
+    except Exception:
+        d = _load_irsa(exp, ra, dec, size)
+        source = "irsa"
+    hdr, img, flags, fhdr, wcs = d["hdr"], d["img"], d["flags"], d["fhdr"], d["wcs"]
 
-        wcs = WCS(hdr)
-        x, y = wcs.world_to_pixel_values(ra, dec)
-        xi, yi = int(round(float(x))), int(round(float(y)))
-        inside = 0 <= xi < img.shape[1] and 0 <= yi < img.shape[0]
+    x, y = (float(v) for v in wcs.world_to_pixel_values(ra, dec))
+    xi, yi = int(round(x)), int(round(y))
+    inside = 0 <= xi < img.shape[1] and 0 <= yi < img.shape[0]
 
-        wavelength = bandwidth = None
-        try:
-            sw = WCS(hdr, fobj=h, key="W")
-            sw.sip = None
-            wl, bw = sw.pixel_to_world(float(x), float(y))
-            wavelength, bandwidth = float(wl.to_value("um")), float(bw.to_value("um"))
-        except Exception:  # spectral WCS lookup table missing or unreadable
-            pass
+    wavelength = bandwidth = None
+    try:
+        spec_hdul, x0, y0 = d["spec"]
+        sw = WCS(hdr, fobj=spec_hdul, key="W")
+        sw.sip = None
+        wl, bw = sw.pixel_to_world(x + x0, y + y0)
+        wavelength, bandwidth = float(wl.to_value("um")), float(bw.to_value("um"))
+    except Exception:  # spectral WCS lookup table missing or unreadable
+        pass
 
-        target_flags = _flag_names(fhdr, int(flags[yi, xi])) if inside else []
-        meta = {
-            "obsid": exp.obsid,
-            "detector": exp.detector,
-            "epoch": exp.epoch,
-            "mjd": float(hdr.get("MJD-AVG", exp.mjd)),
-            "date_obs": str(hdr.get("DATE-OBS", "")),
-            "wavelength_um": wavelength,
-            "bandwidth_um": bandwidth,
-            "psf_fwhm_arcsec": float(hdr.get("PSF_FWHM", np.nan)),
-            "version": str(h[0].header.get("VERSION", "")).strip(),
-            "release": exp.release,
-            "target_on_image": bool(inside),
-            "target_flags": target_flags,
-            "contaminated": bool(set(target_flags) & config.CONTAMINATION_FLAG_NAMES),
-            "saturated": bool(set(target_flags) & config.SATURATION_FLAG_NAMES),
-        }
+    target_flags = _flag_names(fhdr, int(flags[yi, xi])) if inside else []
+    meta = {
+        "obsid": exp.obsid,
+        "detector": exp.detector,
+        "epoch": exp.epoch,
+        "mjd": float(hdr.get("MJD-AVG", exp.mjd)),
+        "date_obs": str(hdr.get("DATE-OBS", "")),
+        "wavelength_um": wavelength,
+        "bandwidth_um": bandwidth,
+        "psf_fwhm_arcsec": float(hdr.get("PSF_FWHM", np.nan)),
+        "version": d["version"],
+        "release": exp.release,
+        "source": source,
+        "target_on_image": bool(inside),
+        "target_flags": target_flags,
+        "contaminated": bool(set(target_flags) & config.CONTAMINATION_FLAG_NAMES),
+        "saturated": bool(set(target_flags) & config.SATURATION_FLAG_NAMES),
+    }
 
     bad = (flags & _flag_bits(fhdr, config.BAD_FLAG_NAMES)) != 0
-    data = img - zodi
-    data[bad | ~np.isfinite(data) | ~(var > 0)] = np.nan
-    # Remove the remaining local sky level so epochs with different zodiacal light match.
+    data = img - d["zodi"] if d["zodi"] is not None else img.copy()
+    data[bad | ~np.isfinite(data)] = np.nan
+    # Remove the remaining local sky level (zodiacal light differs between epochs).
     finite = data[np.isfinite(data)]
+    sky_sigma = np.nan
     if finite.size > 10:
-        _, med, _ = sigma_clipped_stats(finite, sigma=3.0, maxiters=5)
+        _, med, sky_sigma = sigma_clipped_stats(finite, sigma=3.0, maxiters=5)
         data -= np.float32(med)
+    var = d["var"]
+    if var is None:
+        # S3 path skips the VARIANCE plane: use the frame's robust sky noise as a uniform
+        # variance. Good for weighting the stack; photometry errors on bright stars are optimistic.
+        var = np.full(data.shape, np.float32(sky_sigma ** 2 if np.isfinite(sky_sigma) and sky_sigma > 0 else np.nan))
+    var = var.astype(np.float32)
+    data[~(var > 0)] = np.nan
     var[~np.isfinite(data)] = np.nan
 
     img_r, _ = reproject_interp((data, wcs), grid, shape_out=(n, n), order="bilinear")

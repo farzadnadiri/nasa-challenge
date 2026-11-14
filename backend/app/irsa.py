@@ -46,6 +46,7 @@ def _tap_query(adql: str, retries: int = 3) -> Table:
                 config.IRSA_TAP,
                 data={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "votable", "QUERY": adql},
                 timeout=timeout,
+                headers=config.IRSA_HEADERS,
             )
             if r.status_code == 200:
                 return Table.read(io.BytesIO(r.content), format="votable", use_names_over_ids=True)
@@ -94,7 +95,7 @@ def _query_sia(ra: float, dec: float, detectors: list[int]) -> list[Exposure]:
     params = [("COLLECTION", c) for c in config.SIA_COLLECTIONS]
     params += [("POS", f"circle {ra:.7f} {dec:.7f} 0.0003"), ("RESPONSEFORMAT", "votable")]
     try:
-        r = httpx.get(config.IRSA_SIA, params=params,
+        r = httpx.get(config.IRSA_SIA, params=params, headers=config.IRSA_HEADERS,
                       timeout=httpx.Timeout(connect=15, read=config.TAP_DEADLINE_S, write=15, pool=15))
     except httpx.HTTPError as e:
         raise UpstreamError(f"IRSA SIA unavailable ({type(e).__name__})")
@@ -107,7 +108,7 @@ def _query_sia(ra: float, dec: float, detectors: list[int]) -> list[Exposure]:
         band = str(row["energy_bandpassname"])
         if band not in wanted or str(row["dataproduct_subtype"]) != "science":
             continue
-        out.append(_exposure(str(row["access_url"]).replace(config.IRSA_BASE, ""),
+        out.append(_exposure(str(row["access_url"]).replace(config.IRSA_PUBLIC, ""),
                              float(row["t_min"]), int(band[-1])))
     return dedupe(out)
 

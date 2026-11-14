@@ -2,28 +2,39 @@
 import os
 from pathlib import Path
 
-IRSA_BASE = os.environ.get("IRSA_BASE", "https://irsa.ipac.caltech.edu/")
+IRSA_PUBLIC = "https://irsa.ipac.caltech.edu/"
+# On Cloudflare, IRSA blocks the container network, so IRSA_BASE points at the Worker's
+# /api/_irsa/ proxy and every IRSA request carries the shared proxy key.
+IRSA_BASE = os.environ.get("IRSA_BASE", IRSA_PUBLIC)
+IRSA_PROXY_KEY = os.environ.get("IRSA_PROXY_KEY", "")
+IRSA_HEADERS = {"X-Proxy-Key": IRSA_PROXY_KEY} if IRSA_PROXY_KEY else {}
 IRSA_TAP = IRSA_BASE + "TAP/sync"
 IRSA_SIA = IRSA_BASE + "SIA"
 # Newest releases first; update when SPHEREx publishes a new release (QR2 is superseded).
 SIA_COLLECTIONS = os.environ.get("SIA_COLLECTIONS", "spherex_dr1,spherex_qr3").split(",")
+# Public SPHEREx bucket; object keys are the IRSA paths without the ibe/data/spherex/ prefix.
+S3_BASE = os.environ.get("S3_BASE", "https://nasa-irsa-spherex.s3.us-east-1.amazonaws.com/")
 GAIA_TAP = os.environ.get("GAIA_TAP", "https://gea.esac.esa.int/tap-server/tap/sync")
 SESAME = os.environ.get("SESAME", "https://cds.unistra.fr/cgi-bin/nph-sesame/-oxp/SNV")
 
 # Bump when processing changes, so stale cached results are not served.
-PIPELINE_VERSION = "1"
+PIPELINE_VERSION = "3"
 
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", Path(__file__).resolve().parents[1] / ".cache"))
 CACHE_TTL_DAYS = float(os.environ.get("CACHE_TTL_DAYS", "7"))  # SPHEREx ingests weekly
 
 TAP_DEADLINE_S = float(os.environ.get("TAP_DEADLINE_S", "240"))  # give up on a hung archive search
-FETCH_WORKERS =int(os.environ.get("FETCH_WORKERS", "12"))
-MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "2"))
+FETCH_WORKERS = int(os.environ.get("FETCH_WORKERS", "24"))
+MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "3"))
+ABORT_AFTER_FAILURES = 10  # first N cutouts all failed -> stop the job
 MAX_EXPOSURES = int(os.environ.get("MAX_EXPOSURES", "600"))
 
 PIXEL_SCALE_ARCSEC = 6.15  # native SPHEREx pixel
 MIN_FOV_DEG = 0.02
-MAX_FOV_DEG = 0.5
+MAX_FOV_DEG = 0.25
+# Jobs are processed at one of these sizes and every request is cropped from the job's grid,
+# so changing the field of view never starts a new download (9' covers the usual views).
+JOB_FOV_TIERS_DEG = (0.15, 0.25)
 
 # Epochs: SPHEREx revisits a position every ~6 months. Exposures closer together than
 # EPOCH_GAP_DAYS belong to the same visit; long visits (deep fields near the ecliptic

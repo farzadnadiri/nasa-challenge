@@ -25,7 +25,7 @@ def warm(client: httpx.Client, q: str, fov: float, dets: str):
     while True:
         try:
             d = client.get(f"{BASE}/api/frames", params={**params, "mode": "epoch"}).json()
-        except httpx.TransportError as e:  # transient; keep polling
+        except (httpx.TransportError, ValueError) as e:  # transient (incl. non-JSON error page); keep polling
             print(f"\n  retrying after {type(e).__name__}")
             time.sleep(5)
             continue

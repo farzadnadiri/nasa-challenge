@@ -110,6 +110,11 @@ def _run(job: Job):
                         r = f.result()
                     except Exception:
                         job.failed += 1
+                        # Archive unreachable: don't hold a job slot for minutes of retries.
+                        if job.failed >= config.ABORT_AFTER_FAILURES and not job.metas:
+                            for other in futs:
+                                other.cancel()
+                            raise UpstreamError("IRSA image service is unreachable right now. Try again shortly.")
                         continue
                     with job.lock:
                         job.metas.append(r["meta"])

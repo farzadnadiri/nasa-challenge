@@ -5,6 +5,18 @@
   "compatibility_date": "2026-11-01",
   "observability": { "enabled": true },
 
+  // Public site. Wrangler creates the DNS record and certificate for the custom domain;
+  // the workers.dev URL stays on as a fallback.
+  "routes": [{ "pattern": "spherex.peykan.ai", "custom_domain": true }],
+  "workers_dev": true,
+
+  // Public base URL; the container reaches IRSA through <PUBLIC_URL>/api/_irsa/ (see src/index.ts).
+  // IRSA_PROXY_KEY is a secret: `npx wrangler secret put IRSA_PROXY_KEY`.
+  // Bump CONTAINER_GEN when the backend changes: requests then go to a fresh container running
+  // the new image instead of the old instance, which only retires after 30 idle minutes.
+  "vars": { "PUBLIC_URL": "https://spherex.peykan.ai", "CONTAINER_GEN": "4" },
+  "secrets": { "required": ["IRSA_PROXY_KEY"] },
+
   // React build, served directly; /api/* goes through the Worker first.
   "assets": {
     "directory": "../frontend/dist",
@@ -19,7 +31,7 @@
       "class_name": "SpherexApi",
       "image": "../backend/Dockerfile",
       "instance_type": "standard-2",
-      "max_instances": 1
+      "max_instances": 2
     }
   ],
   "durable_objects": {

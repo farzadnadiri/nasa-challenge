@@ -5,6 +5,7 @@ import {
   type FramesResult, type GaiaSource, type PhotPoint, type Resolved, type ViewParams,
 } from './api'
 import { PhotometryCharts } from './components/Charts'
+import { Reference, type RefSource } from './components/Reference'
 import { Viewer } from './components/Viewer'
 import type { StretchOpts } from './render'
 import { formatDec, formatRA, pixelToSky } from './sky'
@@ -41,6 +42,13 @@ export default function App() {
   const [resolved, setResolved] = useState<Resolved | null>(null)
   const [params, setParams] = useState<ViewParams | null>(init.params)
   const [fov, setFov] = useState(init.params?.fov ?? 0.1)
+  // The slider moves a draft; the view updates once it rests, not on every step of a drag.
+  const [fovDraft, setFovDraft] = useState(fov)
+  useEffect(() => {
+    const t = setTimeout(() => setFov(fovDraft), 350)
+    return () => clearTimeout(t)
+  }, [fovDraft])
+  const [refSource, setRefSource] = useState<RefSource>('unwise')
   const [dets, setDets] = useState<number[]>(init.params?.dets ?? [5, 6])
   const [mode, setMode] = useState<'epoch' | 'exposure'>(init.params?.mode ?? 'epoch')
   const [result, setResult] = useState<FramesResult | null>(null)
@@ -70,6 +78,7 @@ export default function App() {
       setQuery(q)
       const f = fovOverride ?? fov
       setFov(f)
+      setFovDraft(f)
       setParams({ ra: r.ra, dec: r.dec, fov: f, dets, mode })
     } catch (e) {
       setError((e as Error).message)
@@ -100,20 +109,33 @@ export default function App() {
 
   // ---- frames, polled until the backend job finishes
   const pollRef = useRef(0)
+  const prevParams = useRef<ViewParams | null>(null)
   useEffect(() => {
     if (!params) return
     const ctrl = new AbortController()
     const myPoll = ++pollRef.current
-    setResult(null); setPick(null); setPhot(null); setIndex(0)
+    // Same target and settings with only a new field of view: keep showing the current frames
+    // until the re-cropped ones arrive (the backend serves them from the same job).
+    const prev = prevParams.current
+    const sameView = !!prev && prev.ra === params.ra && prev.dec === params.dec && prev.mode === params.mode
+      && prev.dets.join() === params.dets.join()
+    prevParams.current = params
+    if (!sameView) { setResult(null); setIndex(0) }
+    setPick(null); setPhot(null)
+    let failures = 0
     const tick = async () => {
       try {
         const r = await fetchFrames(params, ctrl.signal)
         if (myPoll !== pollRef.current) return
+        failures = 0
         setResult(r)
         if (r.status === 'error') { setError(r.error); return }
-        if (r.status !== 'done') setTimeout(tick, r.frames.length ? 3000 : 2000)
+        if (r.status !== 'done') setTimeout(tick, r.frames.length ? 2000 : 1000)
       } catch (e) {
-        if ((e as Error).name !== 'AbortError') setError((e as Error).message)
+        if ((e as Error).name === 'AbortError' || myPoll !== pollRef.current) return
+        // A container restart or a brief network error should not end the session.
+        if (++failures <= 5) setTimeout(tick, 1500 * failures)
+        else setError((e as Error).message)
       }
     }
     setError(null)
@@ -148,7 +170,7 @@ export default function App() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement).tagName === 'INPUT') return
+      if (['INPUT', 'SELECT', 'BUTTON', 'TEXTAREA'].includes((e.target as HTMLElement).tagName)) return
       if (e.key === ' ') { e.preventDefault(); setPlaying((p) => !p) }
       if (e.key === 'ArrowRight') { setPlaying(false); setIndex((i) => (i + 1) % Math.max(1, nFrames)) }
       if (e.key === 'ArrowLeft') { setPlaying(false); setIndex((i) => (i - 1 + nFrames) % Math.max(1, nFrames)) }
@@ -176,18 +198,25 @@ export default function App() {
   const hoverSky = geom && hover ? pixelToSky(geom, hover[0], hover[1]) : null
   const frame = frames[index]
   const progress = result?.progress
-  const running = result && result.status !== 'done' && result.status !== 'error'
+  // A view is set but its first response hasn't arrived yet also counts as loading.
+  const running = !!params && !error && (!result || (result.status !== 'done' && result.status !== 'error'))
 
   return (
     <div className="app">
       <header>
-        <h1>SPHEREx Sky Motion Explorer</h1>
+        <div className="title-row">
+          <h1>SPHEREx Sky Motion Explorer</h1>
+          <span className="team">by Team Braobax</span>
+        </div>
         <p className="tagline">Blink NASA SPHEREx infrared images of any patch of sky to spot things that move or change.</p>
       </header>
 
+      <label className="search-label" htmlFor="target-input">
+        Find a target: <span className="muted">object name or sky coordinates (RA Dec)</span>
+      </label>
       <form className="search" onSubmit={(e) => { e.preventDefault(); if (query.trim()) go(query.trim()) }}>
-        <input value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Object name or coordinates"
-          placeholder="Object name, or RA Dec (e.g. 08:55:10.8 -07:14:42 or 133.795 -7.245)" />
+        <input id="target-input" value={query} onChange={(e) => setQuery(e.target.value)}
+          placeholder="e.g. Barnard's Star · 08:55:10.8 -07:14:42 · 133.795 -7.245" autoComplete="off" />
         <button type="submit" disabled={busy}>{busy ? 'Resolving…' : 'Show'}</button>
       </form>
       <div className="presets">
@@ -201,7 +230,8 @@ export default function App() {
       <main className="layout">
         <section className="stage">
           {grid?.n ? (
-            <>
+            <div className="panes">
+              <div className="pane">
               <Viewer grid={grid} frames={frames} index={index} stretch={stretch} smooth={smooth}
                 gaia={showGaia ? gaia : null} gaiaEpoch={2016.0} pick={pick} onPick={onPick} onHover={setHover} />
               <div className="frame-info">
@@ -214,34 +244,44 @@ export default function App() {
               <div className="cursor muted">
                 {hoverSky ? `${formatRA(hoverSky[0])}  ${formatDec(hoverSky[1])}  (${hoverSky[0].toFixed(5)}, ${hoverSky[1].toFixed(5)})` : 'Hover for coordinates · click a source for its spectrum'}
               </div>
-            </>
+          {running && progress && progress.total > 0 && (
+                <div className="progress" aria-live="polite">
+                  <div className="bar"><div style={{ width: `${(100 * progress.done) / progress.total}%` }} /></div>
+                  <span>Loading exposures {progress.done}/{progress.total}{progress.failed ? ` (${progress.failed} failed)` : ''}. Frames sharpen as data arrives.</span>
+                </div>
+              )}
+
+              {frames.length > 0 && (
+                <div className="strip">
+                  {frames.map((f, i) => (
+                    <button key={i} className={`thumb ${i === index ? 'active' : ''}`} onClick={() => { setPlaying(false); setIndex(i) }}>
+                      <span>{mode === 'epoch' ? f.label.replace('Epoch ', 'E') : i + 1}</span>
+                      <small>{f.date.slice(0, 10)}</small>
+                    </button>
+                  ))}
+                </div>
+              )}
+              </div>
+              <div className="pane">
+                <Reference grid={grid} source={refSource} onSource={setRefSource}
+                  frames={frames.map((f) => f.data)} stretch={stretch} />
+              </div>
+            </div>
           ) : (
             <div className="placeholder">
               {running || busy ? (
                 <p>
-                  {result?.status === 'querying' ? 'Searching the SPHEREx archive at IRSA…' : 'Preparing…'}
-                  <br /><small className="muted">A new position takes 1–3 minutes the first time; after that it is cached.</small>
+                  <span className="spinner" aria-hidden="true" />{' '}
+                  {busy ? 'Looking up the target…'
+                    : result?.status === 'queued' ? 'Waiting for another search to finish…'
+                    : result?.status === 'querying' ? 'Searching the SPHEREx archive…'
+                    : result?.status === 'fetching' ? 'Loading the first exposures…'
+                    : 'Starting…'}
+                  <br /><small className="muted">A new position takes about 10–30 seconds; after that it is cached.</small>
                 </p>
               ) : (
                 <p>Pick a target above or enter coordinates.</p>
               )}
-            </div>
-          )}
-          {running && progress && progress.total > 0 && (
-            <div className="progress" aria-live="polite">
-              <div className="bar"><div style={{ width: `${(100 * progress.done) / progress.total}%` }} /></div>
-              <span>Loading exposures {progress.done}/{progress.total}{progress.failed ? ` (${progress.failed} failed)` : ''} — frames sharpen as data arrives</span>
-            </div>
-          )}
-
-          {frames.length > 0 && (
-            <div className="strip">
-              {frames.map((f, i) => (
-                <button key={i} className={`thumb ${i === index ? 'active' : ''}`} onClick={() => { setPlaying(false); setIndex(i) }}>
-                  <span>{mode === 'epoch' ? f.label.replace('Epoch ', 'E') : i + 1}</span>
-                  <small>{f.date.slice(0, 10)}</small>
-                </button>
-              ))}
             </div>
           )}
         </section>
@@ -256,6 +296,30 @@ export default function App() {
           )}
 
           <fieldset>
+            <legend>View</legend>
+            <div className="seg" role="group" aria-label="Frames to animate">
+              <button aria-pressed={mode === 'epoch'} className={mode === 'epoch' ? 'on' : ''} onClick={() => setMode('epoch')}>Epochs</button>
+              <button aria-pressed={mode === 'exposure'} className={mode === 'exposure' ? 'on' : ''} onClick={() => setMode('exposure')}>Exposures</button>
+            </div>
+            <p className="muted small seg-hint">
+              {mode === 'epoch'
+                ? 'One stacked image per survey visit: best for stars and brown dwarfs.'
+                : 'Every exposure in time order: best for asteroids and comets.'}
+            </p>
+            <div className="seg" role="group" aria-label="Image type">
+              <button aria-pressed={stretch.display === 'frames'} className={stretch.display === 'frames' ? 'on' : ''}
+                onClick={() => setStretch({ ...stretch, display: 'frames' })}>Images</button>
+              <button aria-pressed={stretch.display === 'difference'} className={stretch.display === 'difference' ? 'on' : ''}
+                onClick={() => setStretch({ ...stretch, display: 'difference' })}>Difference</button>
+            </div>
+            <p className="muted small seg-hint">
+              {stretch.display === 'frames'
+                ? 'The images as observed.'
+                : 'Each frame minus the average: still stars vanish, movers show as dark/light pairs.'}
+            </p>
+          </fieldset>
+
+          <fieldset>
             <legend>Playback</legend>
             <div className="row">
               <button onClick={() => setPlaying((p) => !p)}>{playing ? 'Pause' : 'Play'}</button>
@@ -265,10 +329,6 @@ export default function App() {
             <label>Blink interval {speed} ms
               <input type="range" min={100} max={2000} step={50} value={speed} onChange={(e) => setSpeed(+e.target.value)} />
             </label>
-            <div className="seg">
-              <button className={mode === 'epoch' ? 'on' : ''} onClick={() => setMode('epoch')} title="One stacked image per 6-month survey pass: best for stars and brown dwarfs">Epochs</button>
-              <button className={mode === 'exposure' ? 'on' : ''} onClick={() => setMode('exposure')} title="Every single exposure in time order: best for asteroids and comets">Exposures</button>
-            </div>
           </fieldset>
 
           <fieldset>
@@ -290,17 +350,13 @@ export default function App() {
 
           <fieldset>
             <legend>Field of view</legend>
-            <label>{(fov * 60).toFixed(1)}′
-              <input type="range" min={0.02} max={0.25} step={0.01} value={fov} onChange={(e) => setFov(+e.target.value)} />
+            <label>{(fovDraft * 60).toFixed(1)}′
+              <input type="range" min={0.02} max={0.25} step={0.01} value={fovDraft} onChange={(e) => setFovDraft(+e.target.value)} />
             </label>
           </fieldset>
 
           <fieldset>
             <legend>Display</legend>
-            <div className="seg">
-              <button className={stretch.display === 'frames' ? 'on' : ''} onClick={() => setStretch({ ...stretch, display: 'frames' })}>Images</button>
-              <button className={stretch.display === 'difference' ? 'on' : ''} onClick={() => setStretch({ ...stretch, display: 'difference' })} title="Each frame minus the mean of all frames: static sky cancels, movers show as pairs">Difference</button>
-            </div>
             <label>Brightness clip {stretch.highPct}%
               <input type="range" min={95} max={99.95} step={0.05} value={stretch.highPct} onChange={(e) => setStretch({ ...stretch, highPct: +e.target.value })} />
             </label>

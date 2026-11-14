@@ -58,3 +58,12 @@ def test_grid_is_odd_and_centred():
     assert n % 2 == 1
     x, y = w.world_to_pixel_values(10.0, 20.0)
     assert x == pytest.approx((n - 1) / 2) and y == pytest.approx((n - 1) / 2)
+
+
+@pytest.mark.parametrize("fov", [0.02, 0.08, 0.1, 0.12, 0.15])
+def test_crop_stays_centred_on_target(fov):
+    from types import SimpleNamespace
+    from app.main import _crop
+    job_grid, n_job = make_grid(10.0, 20.0, 0.15)
+    n, off = _crop(SimpleNamespace(n=n_job, ra=10.0, dec=20.0), fov)
+    assert n % 2 == 1 and off + (n - 1) / 2 == (n_job - 1) / 2

@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from . import config, gaia, jobs
+from .cutouts import make_grid
 from .irsa import UpstreamError
 from .resolve import resolve as resolve_query
 
@@ -32,9 +33,25 @@ def _detectors(s: str) -> list[int]:
     return d
 
 
+def _fov(fov: float) -> float:
+    return min(max(fov, config.MIN_FOV_DEG), config.MAX_FOV_DEG)
+
+
 def _job(ra: float, dec: float, fov: float, dets: str) -> jobs.Job:
-    fov = min(max(fov, config.MIN_FOV_DEG), config.MAX_FOV_DEG)
-    return jobs.get_or_start(ra % 360.0, dec, fov, _detectors(dets))
+    tier = next(t for t in config.JOB_FOV_TIERS_DEG if t >= _fov(fov) - 1e-9)
+    return jobs.get_or_start(ra % 360.0, dec, tier, _detectors(dets))
+
+
+def _crop(job: jobs.Job, fov: float) -> tuple[int, int]:
+    """(n, offset) of the requested field inside the job grid; both sizes are odd, so it stays centred."""
+    if not job.n:
+        return 0, 0
+    n = min(make_grid(job.ra, job.dec, _fov(fov))[1], job.n)
+    return n, (job.n - n) // 2
+
+
+def _cut(img, n: int, off: int):
+    return None if img is None else img[off:off + n, off:off + n]
 
 
 def _cached_response(body: dict, complete: bool) -> JSONResponse:
@@ -46,7 +63,41 @@ def _cached_response(body: dict, complete: bool) -> JSONResponse:
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "pipeline_version": config.PIPELINE_VERSION}
+    return {"ok": True, "pipeline_version": config.PIPELINE_VERSION,
+            "irsa_base": config.IRSA_BASE, "irsa_proxy_key_set": bool(config.IRSA_PROXY_KEY)}
+
+
+@app.get("/api/diag")
+def diag():
+    """Time a small request to each upstream from wherever this server runs (ops check)."""
+    import socket
+    import time
+
+    import httpx
+
+    checks = {
+        "irsa_sia": (config.IRSA_SIA + "?COLLECTION=spherex_dr1&POS=circle+269.4463+4.7682+0.0003&RESPONSEFORMAT=CSV", 60),
+        "irsa_tap": (config.IRSA_TAP + "?LANG=ADQL&FORMAT=csv&QUERY=SELECT+TOP+1+ra+FROM+fp_psc", 30),
+        "irsa_home": (config.IRSA_BASE, 20),
+        "gaia": (config.GAIA_TAP.replace("/sync", "/availability"), 20),
+        "sesame": (config.SESAME + "?R%20Dra", 20),
+        "irsa_http80": ("http://irsa.ipac.caltech.edu/", 20),
+        "s3_bucket": ("https://nasa-irsa-spherex.s3.us-east-1.amazonaws.com/?list-type=2&max-keys=1&prefix=dr1/level2/", 20),
+    }
+    out = {"dns": {}}
+    for host in ("irsa.ipac.caltech.edu", "gea.esac.esa.int"):
+        try:
+            out["dns"][host] = sorted({a[4][0] for a in socket.getaddrinfo(host, 443)})
+        except OSError as e:
+            out["dns"][host] = f"error: {e}"
+    for name, (url, timeout) in checks.items():
+        t = time.time()
+        try:
+            r = httpx.get(url, timeout=timeout, follow_redirects=True)
+            out[name] = {"status": r.status_code, "seconds": round(time.time() - t, 2), "bytes": len(r.content)}
+        except Exception as e:  # report the failure type, that is the point of this endpoint
+            out[name] = {"error": f"{type(e).__name__}: {e}"[:200], "seconds": round(time.time() - t, 2)}
+    return out
 
 
 @app.get("/api/resolve")
@@ -70,13 +121,14 @@ def frames(
     wl_max: float | None = Query(None, description="micron"),
 ):
     job = _job(ra, dec, fov, dets)
+    n, off = _crop(job, fov)
     complete = job.status == "done"
     body = {
         "key": job.key,
         "status": job.status,
         "error": job.error,
         "progress": {"done": len(job.metas), "total": job.total, "failed": job.failed},
-        "grid": {"n": job.n, "ra": job.ra, "dec": job.dec, "fov": job.fov,
+        "grid": {"n": n, "ra": job.ra, "dec": job.dec, "fov": _fov(fov),
                  "pixel_scale_arcsec": config.PIXEL_SCALE_ARCSEC},
         "detectors": job.detectors,
         "epochs": job.epochs,
@@ -87,10 +139,10 @@ def frames(
         if mode == "epoch":
             for f in jobs.epoch_frames(job, wl_min, wl_max):
                 img = f.pop("image")
-                body["frames"].append({**f, "image": _b64(img)})
+                body["frames"].append({**f, "image": _b64(_cut(img, n, off))})
         else:
             for f in jobs.exposure_frames(job, wl_min, wl_max):
-                body["frames"].append({"meta": f["meta"], "image": _b64(f["image"])})
+                body["frames"].append({"meta": f["meta"], "image": _b64(_cut(f["image"], n, off))})
     return _cached_response(body, complete)
 
 
@@ -107,7 +159,8 @@ def photometry(
     job = _job(ra, dec, fov, dets)
     if job.status not in ("fetching", "done"):
         return _cached_response({"status": job.status, "error": job.error, "points": []}, False)
-    pts, phot_mode = jobs.photometry(job, x, y, r_ap=r, r_in=r * 2, r_out=r * 3.5)
+    _, off = _crop(job, fov)  # x, y are in the (cropped) grid the client sees
+    pts, phot_mode = jobs.photometry(job, x + off, y + off, r_ap=r, r_in=r * 2, r_out=r * 3.5)
     return _cached_response({"status": job.status, "mode": phot_mode, "points": pts}, job.status == "done")
 
 

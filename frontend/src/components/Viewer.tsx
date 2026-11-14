@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Frame, GaiaSource, Grid } from '../api'
 import { computeLimits, displayFrames, renderToImageData, type StretchOpts } from '../render'
 import { propagate, skyToPixel, type GridGeom } from '../sky'
@@ -16,11 +16,20 @@ interface Props {
   onHover: (xy: [number, number] | null) => void
 }
 
-const SIZE = 560 // CSS pixels; the canvas is scaled to fit smaller screens
-const GAIA_MAG_LIMIT = 19
+const GAIA_MAX_MARKERS = 80 // brightest Gaia stars shown; SPHEREx sees few fainter ones, more is clutter
 
 export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, pick, onPick, onHover }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const wrapRef = useRef<HTMLDivElement>(null)
+  // Draw at the canvas's real on-screen size so text and lines stay crisp at any size.
+  const [SIZE, setSize] = useState(640)
+  useEffect(() => {
+    const el = wrapRef.current
+    if (!el) return
+    const ro = new ResizeObserver(([e]) => setSize(Math.max(240, Math.round(e.contentRect.width))))
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
   const geom: GridGeom = useMemo(
     () => ({ n: grid.n, ra: grid.ra, dec: grid.dec, scaleDeg: grid.pixel_scale_arcsec / 3600 }),
     [grid],
@@ -62,15 +71,18 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
     if (gaia && frame) {
       const dt = frame.decimalYear - gaiaEpoch
       ctx.lineWidth = 1.25
+      let shown = 0
+      // Sources arrive sorted brightest first; fast movers are always drawn.
       for (const s of gaia) {
-        // SPHEREx (6″ pixels, shallow per epoch) sees little fainter than this; more just clutters.
-        if (s.phot_g_mean_mag != null && s.phot_g_mean_mag > GAIA_MAG_LIMIT) continue
+        const fastMover = Math.hypot(s.pmra ?? 0, s.pmdec ?? 0) > 200
+        if (shown >= GAIA_MAX_MARKERS && !fastMover) continue
         const pmra = s.pmra ?? 0, pmdec = s.pmdec ?? 0
         const [ra, dec] = propagate(s.ra, s.dec, pmra, pmdec, dt)
         const p = skyToPixel(geom, ra, dec)
         if (!p) continue
         const [cx, cy] = toCanvas(p[0], p[1])
         if (cx < -10 || cy < -10 || cx > SIZE + 10 || cy > SIZE + 10) continue
+        shown++
         const fast = Math.hypot(pmra, pmdec) > 200
         ctx.strokeStyle = fast ? 'rgba(255, 92, 92, 0.95)' : 'rgba(80, 200, 255, 0.7)'
         ctx.beginPath()
@@ -128,7 +140,7 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
       ctx.fillStyle = 'rgba(255,255,255,0.95)'
       ctx.fillText(text, x, y)
     }
-  }, [bitmaps, index, smooth, gaia, gaiaEpoch, frames, geom, grid, pick])
+  }, [bitmaps, index, smooth, gaia, gaiaEpoch, frames, geom, grid, pick, SIZE])
 
   const toGrid = (e: React.MouseEvent<HTMLCanvasElement>): [number, number] => {
     const r = e.currentTarget.getBoundingClientRect()
@@ -138,13 +150,15 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
   }
 
   return (
-    <canvas
-      ref={canvasRef}
-      className="viewer"
-      style={{ width: '100%', maxWidth: SIZE, aspectRatio: '1 / 1' }}
-      onClick={(e) => onPick(...toGrid(e))}
-      onMouseMove={(e) => onHover(toGrid(e))}
-      onMouseLeave={() => onHover(null)}
-    />
+    <div ref={wrapRef} className="viewer-wrap">
+      <canvas
+        ref={canvasRef}
+        className="viewer"
+        style={{ width: '100%', height: 'auto', aspectRatio: '1 / 1' }}
+        onClick={(e) => onPick(...toGrid(e))}
+        onMouseMove={(e) => onHover(toGrid(e))}
+        onMouseLeave={() => onHover(null)}
+      />
+    </div>
   )
 }
