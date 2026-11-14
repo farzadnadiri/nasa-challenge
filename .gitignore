@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+backend/.cache/
+.uvicorn.log
+node_modules/
+frontend/dist/
+worker/.wrangler/
+.dev.vars

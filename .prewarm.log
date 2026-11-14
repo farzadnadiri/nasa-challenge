@@ -1,0 +1,5 @@
+Barnard's Star                   done      116/119 failed=3 epochs=5     0s  
+eps Ind B                        done      171/177 failed=6 epochs=6     0s  
+WISE J085510.83-071442.5         querying  0/0 failed=0 epochs=0     0sWISE J085510.83-071442.5         fetching  8/93 failed=0 epochs=4     7sWISE J085510.83-071442.5         fetching  26/93 failed=1 epochs=4    14sWISE J085510.83-071442.5         fetching  43/93 failed=2 epochs=4    19sWISE J085510.83-071442.5         fetching  68/93 failed=2 epochs=4    26sWISE J085510.83-071442.5         done      91/93 failed=2 epochs=4    33s  
+RW Aur                           done      110/112 failed=2 epochs=3     0s  
+R Dra                            done      178/180 failed=2 epochs=7     0s  
