@@ -325,17 +325,31 @@ export default function App() {
   }, [nFrames])
 
   // ---- photometry at a clicked pixel
+  // While the view is still being built the backend has nothing to measure yet: ask again every
+  // few seconds instead of showing an empty result. A newer click cancels the older one.
+  const pickSeq = useRef(0)
+  const [photNote, setPhotNote] = useState<string | null>(null)
   const onPick = async (x: number, y: number) => {
     if (!params || !result?.grid.n) return
     setPick([x, y])
     setPhot(null)
+    setPhotNote(null)
+    const seq = ++pickSeq.current
     try {
-      const r = await fetchPhotometry(params, x, y)
-      setPhot(r.points)
-      setPhotMode(r.mode)
-      setPhotUnit(r.unit ?? 'mJy')
+      for (let attempt = 0; attempt < 200; attempt++) {
+        const r = await fetchPhotometry(params, x, y)
+        if (seq !== pickSeq.current) return
+        if (r.status === 'done' || r.status === 'error') {
+          if (r.status === 'error') setPhotNote('The images for this view could not be loaded, so nothing was measured.')
+          else { setPhot(r.points); setPhotMode(r.mode); setPhotUnit(r.unit ?? 'mJy') }
+          return
+        }
+        setPhotNote('The images are still loading. The spectrum appears as soon as every exposure is in.')
+        await new Promise((res) => setTimeout(res, 3000))
+        if (seq !== pickSeq.current) return
+      }
     } catch (e) {
-      setError((e as Error).message)
+      if (seq === pickSeq.current) setError((e as Error).message)
     }
   }
 
@@ -549,13 +563,9 @@ export default function App() {
               <h2>Source at {geom ? (() => { const s = pixelToSky(geom, pick[0], pick[1]); return `${formatRA(s[0])} ${formatDec(s[1])}` })() : ''}</h2>
               {phot ? <PhotometryCharts points={phot} mode={photMode} unit={photUnit}
                 hiddenEpochs={skipShallow && mode === 'epoch' ? (result?.frames ?? []).flatMap((f, i) => (f.shallow ? [i] : [])) : []}
-                epochDates={result?.epochs.map((e) => e.date_mid) ?? []} /> : <p className="muted">Measuring…</p>}
+                epochDates={result?.epochs.map((e) => e.date_mid) ?? []} />
+                : <p className="muted">{photNote ? <><span className="spinner spinner-sm" aria-hidden="true" /> {photNote}</> : 'Measuring…'}</p>}
             </section>
-          )}
-
-          {params && result && result.frames.length > 0 && (
-            <ExposureTable params={params} ready={result.status === 'done'}
-              currentKey={mode === 'exposure' && frame?.meta ? `${frame.meta.obsid}D${frame.meta.detector}` : undefined} />
           )}
 
           {result?.status === 'done' && result.frames.length === 0 && (
@@ -710,18 +720,6 @@ export default function App() {
             </label>
           </fieldset>
 
-          <fieldset>
-            <legend>Overlays</legend>
-            <label className="check"><input type="checkbox" checked={showTarget} onChange={(e) => setShowTarget(e.target.checked)} /> Target crosshair <small className="muted">(yellow)</small></label>
-            <label className="check"><input type="checkbox" checked={showGaia} onChange={(e) => setShowGaia(e.target.checked)} /> Gaia DR3 stars <small className="muted">(blue circles, fast in red)</small></label>
-            <label className="check"><input type="checkbox" checked={showWise} onChange={(e) => setShowWise(e.target.checked)} /> WISE sources <small className="muted">(CatWISE2020, orange squares)</small></label>
-            <label className="check"><input type="checkbox" checked={findMovers} onChange={(e) => setFindMovers(e.target.checked)} /> Moving sources <small className="muted">(magenta diamonds and tracks)</small></label>
-            <label className="check"><input type="checkbox" checked={showContam} onChange={(e) => setShowContam(e.target.checked)} /> Contamination map <small className="muted">(flagged pixels)</small></label>
-            <label className="check"><input type="checkbox" checked={showPick} onChange={(e) => setShowPick(e.target.checked)} /> Clicked source <small className="muted">(green circle)</small></label>
-            <label className="check"><input type="checkbox" checked={showFirstMark} onChange={(e) => setShowFirstMark(e.target.checked)} /> First-frame border <small className="muted">(dashed yellow)</small></label>
-            <label className="check"><input type="checkbox" checked={showCompass} onChange={(e) => setShowCompass(e.target.checked)} /> Compass and scale bar</label>
-          </fieldset>
-
           {!params?.dataset && <fieldset>
             <legend>Wavelength (detectors)</legend>
             <div className="dets">
@@ -738,6 +736,18 @@ export default function App() {
             </div>
             <p className="muted small">Brown dwarfs are brightest in D5–D6. Fewer detectors load faster.</p>
           </fieldset>}
+
+          <fieldset>
+            <legend>Overlays</legend>
+            <label className="check"><input type="checkbox" checked={showTarget} onChange={(e) => setShowTarget(e.target.checked)} /> Target crosshair <small className="muted">(yellow)</small></label>
+            <label className="check"><input type="checkbox" checked={showGaia} onChange={(e) => setShowGaia(e.target.checked)} /> Gaia DR3 stars <small className="muted">(blue circles, fast in red)</small></label>
+            <label className="check"><input type="checkbox" checked={showWise} onChange={(e) => setShowWise(e.target.checked)} /> WISE sources <small className="muted">(CatWISE2020, orange squares)</small></label>
+            <label className="check"><input type="checkbox" checked={findMovers} onChange={(e) => setFindMovers(e.target.checked)} /> Moving sources <small className="muted">(magenta diamonds and tracks)</small></label>
+            <label className="check"><input type="checkbox" checked={showContam} onChange={(e) => setShowContam(e.target.checked)} /> Contamination map <small className="muted">(flagged pixels)</small></label>
+            <label className="check"><input type="checkbox" checked={showPick} onChange={(e) => setShowPick(e.target.checked)} /> Clicked source <small className="muted">(green circle)</small></label>
+            <label className="check"><input type="checkbox" checked={showFirstMark} onChange={(e) => setShowFirstMark(e.target.checked)} /> First-frame border <small className="muted">(dashed yellow)</small></label>
+            <label className="check"><input type="checkbox" checked={showCompass} onChange={(e) => setShowCompass(e.target.checked)} /> Compass and scale bar</label>
+          </fieldset>
 
           <fieldset>
             <legend>Data</legend>
@@ -797,6 +807,11 @@ export default function App() {
           </fieldset>
         </aside>
       </main>
+
+      {params && result && result.frames.length > 0 && (
+        <ExposureTable params={params} ready={result.status === 'done'}
+          currentKey={mode === 'exposure' && frame?.meta ? `${frame.meta.obsid}D${frame.meta.detector}` : undefined} />
+      )}
 
       <footer className="muted small">
         Data: NASA SPHEREx via NASA/IPAC Infrared Science Archive (IRSA); ESA Gaia DR3; CDS Sesame.

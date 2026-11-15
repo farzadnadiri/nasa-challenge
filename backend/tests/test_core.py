@@ -360,3 +360,81 @@ def test_saturated_mover_without_gaia_is_doubtful(monkeypatch):
     monkeypatch.setattr(movers.gaia, "cone", lambda *a, **k: {"sources": [FAR_STAR]})
     ms = movers.find_movers(job, frames)["movers"]
     assert len(ms) == 1 and ms[0]["status"] == "doubtful" and ms[0]["reason"] == "saturated"
+
+
+def test_result_versions_match_worker_config():
+    import json
+    import pathlib
+    import re
+    from app import config
+    wrangler = (pathlib.Path(__file__).resolve().parents[2] / "worker" / "wrangler.jsonc").read_text(encoding="utf-8")
+    worker = json.loads(re.search(r'"RESULT_VERSIONS":\s*(\{[^}]*\})', wrangler).group(1))
+    assert worker == config.RESULT_VERSIONS, "keep RESULT_VERSIONS in backend/app/config.py and worker/wrangler.jsonc equal"
+
+
+def test_store_splits_and_reassembles(monkeypatch):
+    import httpx
+    from app import config, store
+    objects = {}
+
+    def handler(req: httpx.Request):
+        name = req.url.path.split("/api/_store/")[1]
+        if req.method == "PUT":
+            objects[name] = req.content
+            return httpx.Response(200)
+        return httpx.Response(200, content=objects[name]) if name in objects else httpx.Response(404)
+
+    monkeypatch.setattr(config, "STORE_BASE", "https://x/api/_store/")
+    monkeypatch.setattr(config, "IRSA_PROXY_KEY", "k")
+    monkeypatch.setattr(store, "_client", httpx.Client(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(store, "CHUNK_BYTES", 1000)
+    data = bytes(range(256)) * 10  # 2560 bytes -> 3 parts
+    assert store.put("jobs/abc.npz", data)
+    assert sorted(objects) == ["jobs/abc.npz.0", "jobs/abc.npz.1", "jobs/abc.npz.2", "jobs/abc.npz.meta"]
+    assert store.get("jobs/abc.npz") == data
+    assert store.get("jobs/missing.json") is None
+    objects["jobs/abc.npz.1"] = b"x" * 1000  # an overwrite caught half way is never returned
+    assert store.get("jobs/abc.npz") is None
+
+
+def test_finished_job_survives_a_new_container(monkeypatch, tmp_path):
+    # A job saved by one container is restored by the next one (empty disk) from the shared store.
+    import time
+    import numpy as np
+    from app import config, jobs, store
+    saved = {}
+    monkeypatch.setattr(store, "put", lambda name, data: saved.__setitem__(name, data) or True)
+    monkeypatch.setattr(store, "get", lambda name: saved.get(name))
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path / "a")
+    job = jobs.Job("k1", 10.0, 20.0, 0.1, [6], ["spherex_dr1"], status="done", pixel_scale=6.15, n=2, total=2,
+                   epochs=[{"index": 0, "decimal_year": 2025.5}], metas=[{"epoch": 0}, {"epoch": 0}])
+    job.images = [np.ones((5, 5), np.float32)] * 2
+    job.variances = [np.ones((5, 5), np.float32)] * 2
+    job.contams = [None, None]
+    jobs._save_cached(job)
+    for _ in range(100):  # the upload runs in the background
+        if "jobs/k1.json" in saved:
+            break
+        time.sleep(0.02)
+    assert set(saved) == {"jobs/k1.npz", "jobs/k1.json"}
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path / "b")  # the new container's empty disk
+    back = jobs._restore("k1")
+    assert back and back.status == "done" and len(back.images) == 2 and back.pixel_scale == 6.15
+
+
+def test_photometry_contamination_is_judged_at_the_clicked_spot():
+    import numpy as np
+    from app import jobs
+    job = jobs.Job("ph", 10.0, 20.0, 0.1, [6], ["spherex_dr1"], status="done", pixel_scale=6.15)
+    n = 21
+    for i in range(2):
+        job.images.append(np.ones((n, n), np.float32))
+        job.variances.append(np.ones((n, n), np.float32))
+        job.metas.append({"mjd": 60800.0 + i, "epoch": 0, "detector": 6, "wavelength_um": 4.5,
+                          "target_flags": ["HALO"] if i == 0 else []})  # flagged at the field centre only
+        mask = np.zeros((n, n), np.uint8)
+        if i == 1:
+            mask[3:6, 3:6] = 1  # a ghost on the clicked source
+        job.contams.append(mask)
+    pts, _ = jobs.photometry(job, 4.0, 4.0)
+    assert [p["contaminated"] for p in sorted(pts, key=lambda p: p["mjd"])] == [False, True]

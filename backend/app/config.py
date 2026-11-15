@@ -10,6 +10,7 @@ IRSA_PROXY_KEY = os.environ.get("IRSA_PROXY_KEY", "")
 IRSA_HEADERS = {"X-Proxy-Key": IRSA_PROXY_KEY} if IRSA_PROXY_KEY else {}
 # Uploaded datasets are read through the Worker's internal /api/_upload/ route (same key).
 UPLOAD_BASE = os.environ.get("UPLOAD_BASE", "http://localhost:8787/api/_upload/")
+STORE_BASE = os.environ.get("STORE_BASE", "")  # finished jobs in R2 via the Worker (empty: off)
 IRSA_TAP = IRSA_BASE + "TAP/sync"
 IRSA_SIA = IRSA_BASE + "SIA"
 # Releases are discovered automatically (newest DR + newest QR, from the S3 bucket's folders).
@@ -27,11 +28,23 @@ SESAME = os.environ.get("SESAME", "https://cds.unistra.fr/cgi-bin/nph-sesame/-ox
 
 # Bump when processing changes, so stale cached results are not served.
 PIPELINE_VERSION = "4"  # 4: contamination masks
+# Version of each kind of API result. The Worker keys its response cache by these (repeated in
+# worker/wrangler.jsonc as RESULT_VERSIONS; a test keeps the two equal), so a deploy only empties
+# the cache of results whose version changed. Bump the one whose output changes; image-based
+# results include PIPELINE_VERSION, so a change to image processing renews them all.
+RESULT_VERSIONS = {
+    "frames": f"{PIPELINE_VERSION}.1",
+    "exposures": f"{PIPELINE_VERSION}.1",
+    "photometry": f"{PIPELINE_VERSION}.2",
+    "movers": f"{PIPELINE_VERSION}.5",
+    "gaia": "2",
+    "catwise": "1",
+}
 # Baked into the image and sent as X-Backend-Gen; the Worker caches a response only when this matches
 # its CONTAINER_GEN. An old image still running during a rollout reports its own, older number, so
 # its answers are never cached under the new generation. Bump together with CONTAINER_GEN in
 # worker/wrangler.jsonc (tests/test_core.py checks they match).
-BACKEND_GEN = "20"
+BACKEND_GEN = "22"
 
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", Path(__file__).resolve().parents[1] / ".cache"))
 CACHE_TTL_DAYS = float(os.environ.get("CACHE_TTL_DAYS", "7"))  # SPHEREx ingests weekly

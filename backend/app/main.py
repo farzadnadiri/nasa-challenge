@@ -83,9 +83,11 @@ def _cut(img, n: int, off: int):
     return None if img is None else img[off:off + n, off:off + n]
 
 
-def _cached_response(body: dict, complete: bool) -> JSONResponse:
-    # The Cloudflare Worker stores responses in R2 only when X-Complete is true.
+def _cached_response(kind: str, body: dict, complete: bool) -> JSONResponse:
+    # The Cloudflare Worker stores responses in R2 only when X-Complete is true and X-Result-Version
+    # is the version it expects for this kind of result (so older code is never cached as newer).
     headers = {"X-Complete": "true" if complete else "false", "X-Backend-Gen": config.BACKEND_GEN,
+               "X-Result-Version": config.RESULT_VERSIONS[kind],
                "Cache-Control": "public, max-age=86400" if complete else "no-store"}
     return JSONResponse(body, headers=headers)
 
@@ -185,7 +187,7 @@ def frames(
                 body["frames"].append({"meta": f["meta"], "image": _b64(_cut(f["image"], n, off)),
                                        "contam": _b64u8(_cut(f["contam"], n, off))})
     # A refresh request is never cached; the Worker clears this view's stored results instead.
-    return _cached_response(body, complete and not refresh)
+    return _cached_response("frames", body, complete and not refresh)
 
 
 @app.get("/api/catwise")
@@ -193,7 +195,7 @@ def catwise_cone(ra: float = Query(..., ge=0, le=360), dec: float = Query(..., g
                  radius: float = Query(0.08, gt=0, le=0.5)):
     """CatWISE2020 (WISE) sources for the overlay; positions at 2015.4, proper motions in mas/yr."""
     try:
-        return _cached_response(catwise.cone(ra, dec, radius), True)
+        return _cached_response("catwise", catwise.cone(ra, dec, radius), True)
     except UpstreamError as e:
         raise HTTPException(503, str(e))
 
@@ -215,19 +217,19 @@ def movers_endpoint(
     """Moving sources found across the epochs; 'candidate' = no Gaia star moving with it."""
     job = _view_job(ra, dec, fov, dets, release, deep, dataset)
     if job.status != "done":
-        return _cached_response({"status": job.status, "error": job.error, "movers": []}, False)
+        return _cached_response("movers", {"status": job.status, "error": job.error, "movers": []}, False)
     if debug:
-        return _cached_response({"status": "done", **find_movers(job, jobs.epoch_frames(job), debug=True)}, False)
+        return _cached_response("movers", {"status": "done", **find_movers(job, jobs.epoch_frames(job), debug=True)}, False)
     if job.movers is None:
         with _mover_locks.setdefault(job.key, threading.Lock()):  # one search per job, others wait for it
             if job.movers is None:
                 res = find_movers(job, jobs.epoch_frames(job))
                 if not res.get("gaia_checked"):
                     # Gaia was unreachable: answer now, but search again next time instead of keeping it
-                    return _cached_response({"status": "done", **res}, False)
+                    return _cached_response("movers", {"status": "done", **res}, False)
                 job.movers = res
     # Positions are sky coordinates, so the client places them in whatever field it shows.
-    return _cached_response({"status": "done", **job.movers}, True)
+    return _cached_response("movers", {"status": "done", **job.movers}, True)
 
 
 @app.get("/api/releases")
@@ -250,7 +252,7 @@ def exposures(
     """Per-exposure metadata (date, detector, wavelength, flags at the target...) without pixels."""
     job = _view_job(ra, dec, fov, dets, release, deep, dataset)
     rows = jobs.exposure_list(job) if job.status in ("fetching", "done") else []
-    return _cached_response({"status": job.status, "error": job.error, "epochs": job.epochs, "exposures": rows},
+    return _cached_response("exposures", {"status": job.status, "error": job.error, "epochs": job.epochs, "exposures": rows},
                             job.status == "done")
 
 
@@ -269,11 +271,11 @@ def photometry(
 ):
     job = _view_job(ra, dec, fov, dets, release, deep, dataset)
     if job.status not in ("fetching", "done"):
-        return _cached_response({"status": job.status, "error": job.error, "points": []}, False)
+        return _cached_response("photometry", {"status": job.status, "error": job.error, "points": []}, False)
     _, off = _crop(job, fov)  # x, y are in the (cropped) grid the client sees
     pts, phot_mode = jobs.photometry(job, x + off, y + off, r_ap=r, r_in=r * 2, r_out=r * 3.5)
     unit = job.units if job.dataset else "mJy"
-    return _cached_response({"status": job.status, "mode": phot_mode, "unit": unit, "points": pts},
+    return _cached_response("photometry", {"status": job.status, "mode": phot_mode, "unit": unit, "points": pts},
                             job.status == "done")
 
 
@@ -281,6 +283,6 @@ def photometry(
 def gaia_cone(ra: float = Query(..., ge=0, le=360), dec: float = Query(..., ge=-90, le=90),
               radius: float = Query(0.08, gt=0, le=0.5)):
     try:
-        return _cached_response(gaia.cone(ra, dec, radius), True)
+        return _cached_response("gaia", gaia.cone(ra, dec, radius), True)
     except UpstreamError as e:
         raise HTTPException(503, str(e))

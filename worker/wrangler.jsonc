@@ -13,8 +13,15 @@
   // Public base URL; the container reaches IRSA through <PUBLIC_URL>/api/_irsa/ (see src/index.ts).
   // IRSA_PROXY_KEY is a secret: `npx wrangler secret put IRSA_PROXY_KEY`.
   // Bump CONTAINER_GEN when the backend changes: requests then go to a fresh container running
-  // the new image instead of the old instance, which only retires after 30 idle minutes.
-  "vars": { "PUBLIC_URL": "https://spherex.peykan.ai", "CONTAINER_GEN": "20" },
+  // the new image instead of the old instance, which only retires after 30 idle minutes. It does
+  // not empty any cache: cached API responses are keyed by RESULT_VERSIONS (the same table as
+  // backend/app/config.py; bump only the kind of result whose output changed), and finished
+  // image stacks are kept in R2, so a new container loads them instead of rebuilding.
+  "vars": {
+    "PUBLIC_URL": "https://spherex.peykan.ai",
+    "CONTAINER_GEN": "22",
+    "RESULT_VERSIONS": { "frames": "4.1", "exposures": "4.1", "photometry": "4.2", "movers": "4.5", "gaia": "2", "catwise": "1" }
+  },
   "secrets": { "required": ["IRSA_PROXY_KEY"] },
 
   // React build, served directly; /api/* goes through the Worker first.

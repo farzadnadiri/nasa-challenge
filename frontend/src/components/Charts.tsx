@@ -174,7 +174,11 @@ export function PhotometryCharts({ points, epochDates, mode, hiddenEpochs = [], 
   // SPHEREx: mJy; uploaded data: its own units, summed over the aperture.
   const unit = wing ? `wing flux, ${dataUnit}` : dataUnit === 'mJy' ? 'mJy' : `${dataUnit}, summed`
   // Same epochs as the viewer: shallow ones are hidden there by default, so here too.
-  const clean = points.filter((p) => !p.contaminated && p.wavelength_um != null && !hiddenEpochs.includes(p.epoch))
+  // Exposures flagged as contaminated at this spot are left out unless asked for.
+  const [withFlagged, setWithFlagged] = useState(false)
+  const usable = points.filter((p) => p.wavelength_um != null && !hiddenEpochs.includes(p.epoch))
+  const nFlagged = usable.filter((p) => p.contaminated).length
+  const clean = usable.filter((p) => withFlagged || !p.contaminated)
   const names = epochDates.map((d, i) => `Epoch ${i + 1} (${d})`)
 
   const spectrum: Pt[] = clean.map((p) => ({
@@ -212,13 +216,29 @@ export function PhotometryCharts({ points, epochDates, mode, hiddenEpochs = [], 
       tip: `${epochDates[ep] ?? ''} · ${med.toFixed(2)}× average · ${ps.length} exposures` })
   }
 
-  if (!clean.length) return <p className="muted">No clean photometry at this position.</p>
+  if (!usable.length) {
+    return <p className="muted">Nothing to measure here: the aperture falls on masked or uncovered pixels in every exposure (for example the edge of the field or a saturated core).</p>
+  }
+  if (!clean.length) {
+    return (
+      <p className="muted">
+        All {nFlagged} measurements here are flagged as contaminated (light from a ghost, halo, streak or crosstalk at this spot).{' '}
+        <button className="link-btn" onClick={() => setWithFlagged(true)}>Show them anyway</button>
+      </p>
+    )
+  }
   return (
     <div className="charts">
       <div className="charts-head">
         <span className="muted small">
           {clean.length} measurements from {new Set(clean.map((p) => p.epoch)).size} epochs
         </span>
+        {nFlagged > 0 && (
+          <label className="check small">
+            <input type="checkbox" checked={withFlagged} onChange={(e) => setWithFlagged(e.target.checked)} />
+            Include {nFlagged} flagged as contaminated
+          </label>
+        )}
         <button className="download-btn" onClick={() => downloadCSV(points, epochDates)}>
           <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1v9M4 6.5 8 10.5 12 6.5M2 13.5h12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /></svg>
           Download CSV

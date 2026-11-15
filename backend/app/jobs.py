@@ -17,7 +17,7 @@ import numpy as np
 from astropy.time import Time
 
 from . import config
-from . import uploads
+from . import store, uploads
 from .cutouts import clean_and_reproject, make_grid, process_exposure
 from .irsa import Exposure, UpstreamError, assign_epochs, query_exposures
 
@@ -66,13 +66,27 @@ def job_key(ra: float, dec: float, fov: float, detectors: list[int], collections
     return hashlib.sha1(s.encode()).hexdigest()[:16]
 
 
+_restore_locks: dict[str, threading.Lock] = {}
+
+
+def _restore(key: str) -> Job | None:
+    """A finished job from this container's disk or, after a deploy, from the shared store.
+    Called without the global lock: a download can take a few seconds."""
+    with _restore_locks.setdefault(key, threading.Lock()):
+        return _load_cached(key)
+
+
 def get_or_start(ra: float, dec: float, fov: float, detectors: list[int], collections: list[str],
                  refresh: bool = False) -> Job:
     """refresh=True re-runs the archive search for a finished view ('check for new data'), at most
     once per REFRESH_MIN_S per view so the archive cannot be hammered."""
     key = job_key(ra, dec, fov, detectors, collections)
     with _jobs_lock:
-        job = _jobs.get(key) or _load_cached(key)
+        job = _jobs.get(key)
+    if job is None:
+        job = _restore(key)
+    with _jobs_lock:
+        job = _jobs.get(key) or job
         if job and refresh and job.status in ("done", "error") and time.time() - job.started >= config.REFRESH_MIN_S:
             for p in _paths(key):
                 p.unlink(missing_ok=True)
@@ -96,7 +110,11 @@ def get_or_start_dataset(dataset: str, ra: float | None, dec: float | None) -> J
     target = (round(ra, 6), round(dec, 6)) if ra is not None and dec is not None else None
     key = hashlib.sha1(f"ds|{dataset}|{target}|{config.PIPELINE_VERSION}".encode()).hexdigest()[:16]
     with _jobs_lock:
-        job = _jobs.get(key) or _load_cached(key)
+        job = _jobs.get(key)
+    if job is None:
+        job = _restore(key)
+    with _jobs_lock:
+        job = _jobs.get(key) or job
         if job and job.status != "error":
             _jobs[key] = job
             return job
@@ -238,6 +256,14 @@ def _run(job: Job):
 def _contaminated(m: dict) -> bool:
     """Computed from the stored flag names so cached results follow config changes."""
     return bool(set(m.get("target_flags", [])) & config.CONTAMINATION_FLAG_NAMES)
+
+
+def _contaminated_at(m: dict, mask: np.ndarray | None, ap: np.ndarray) -> bool:
+    """Contaminated where it is measured: any flagged pixel in the aperture. The exposure's flags
+    at the field centre only stand in when there is no mask (uploaded data has none)."""
+    if mask is None or mask.shape != ap.shape:
+        return _contaminated(m)
+    return bool(mask[ap].any())
 
 
 def _saturated(m: dict) -> bool:
@@ -382,6 +408,8 @@ def photometry(job: Job, x: float, y: float, r_ap: float = 2.0, r_in: float = 4.
     metas, images, variances = job.snapshot()
     if not images:
         return [], "aperture"
+    with job.lock:
+        contams = list(job.contams)
     n = images[0].shape[0]
     yy, xx = np.mgrid[0:n, 0:n]
     d = np.hypot(xx - x, yy - y)
@@ -401,7 +429,7 @@ def photometry(job: Job, x: float, y: float, r_ap: float = 2.0, r_in: float = 4.
     ann = (d >= r_in) & (d <= r_out)
 
     out = []
-    for m, im, var in zip(metas, images, variances):
+    for i, (m, im, var) in enumerate(zip(metas, images, variances)):
         a = im[ap]
         ok = np.isfinite(a)
         # Aperture: every pixel needed. Wing ring: tolerate a few masked pixels, scaled up.
@@ -412,7 +440,8 @@ def photometry(job: Job, x: float, y: float, r_ap: float = 2.0, r_in: float = 4.
         err = np.sqrt(np.nansum(var[ap])) * to_mjy
         out.append({"mjd": m["mjd"], "epoch": m["epoch"], "detector": m["detector"],
                     "wavelength_um": m["wavelength_um"], "flux_mjy": float(flux), "err_mjy": float(err),
-                    "contaminated": _contaminated(m), "saturated": _saturated(m)})
+                    "contaminated": _contaminated_at(m, contams[i] if i < len(contams) else None, ap),
+                    "saturated": _saturated(m)})
     return sorted(out, key=lambda p: p["mjd"]), mode
 
 
@@ -437,11 +466,22 @@ def _save_cached(job: Job):
         "saved": time.time(),
     }))
 
+    # Copy to the shared store in the background (the npz first: the json marks it complete).
+    def share():
+        if store.put(f"jobs/{job.key}.npz", npzp.read_bytes()):
+            store.put(f"jobs/{job.key}.json", jp.read_bytes())
+    threading.Thread(target=share, daemon=True).start()
+
 
 def _load_cached(key: str) -> Job | None:
     jp, npzp = _paths(key)
     if not (jp.exists() and npzp.exists()):
-        return None
+        meta = store.get(f"jobs/{key}.json")
+        arrays = store.get(f"jobs/{key}.npz") if meta else None
+        if not arrays:
+            return None
+        npzp.write_bytes(arrays)
+        jp.write_bytes(meta)
     d = json.loads(jp.read_text())
     if time.time() - d["saved"] > config.CACHE_TTL_DAYS * 86400:
         return None

@@ -17,6 +17,8 @@ export class SpherexApi extends Container<Env> {
       IRSA_BASE: `${env.PUBLIC_URL}/api/_irsa/`,
       IRSA_PROXY_KEY: env.IRSA_PROXY_KEY,
       UPLOAD_BASE: `${env.PUBLIC_URL}/api/_upload/`,
+      // Finished image stacks, shared across container generations (see store()).
+      STORE_BASE: `${env.PUBLIC_URL}/api/_store/`,
       // Echoed back by the backend; see the caching rule in fetch().
       CONTAINER_GEN: env.CONTAINER_GEN,
     }
@@ -32,19 +34,45 @@ const IRSA = 'https://irsa.ipac.caltech.edu/'
 // Only what the backend needs: image search and SPHEREx image cutouts. Never an open proxy.
 const IRSA_ALLOWED = [/^SIA$/, /^TAP\/sync$/, /^ibe\/data\/spherex\/[\w./-]+\.fits$/]
 
-// Keyed by container generation too, so a backend change never serves results from the old pipeline.
-// Keys start with the view (position, detectors, release, Deep Fields), so "check for new data"
-// can delete everything stored for one view: all modes, field sizes and clicked sources.
-function viewPrefix(url: URL, gen: string): string {
+// Keyed by the version of that kind of result (RESULT_VERSIONS in wrangler.jsonc), so a backend
+// change renews only the results it affects. Keys start with the view (position, detectors,
+// release, Deep Fields), so "check for new data" can delete everything stored for one view:
+// all modes, field sizes and clicked sources.
+function viewPrefix(url: URL): string {
   const q = url.searchParams
   const view = [q.get('ra') ?? '', q.get('dec') ?? '', q.get('dets') ?? '', q.get('release') ?? 'auto',
     ['1', 'true'].includes(q.get('deep') ?? '') ? 'deep' : 'wide', q.get('dataset') ?? ''].join('|')
-  return `g${gen}/${view}/`
+  return `r/${view}/`
 }
 
-function cacheKey(url: URL, gen: string): string {
+function resultVersion(url: URL, env: Env): string | undefined {
+  return (env.RESULT_VERSIONS as Record<string, string>)[url.pathname.slice('/api/'.length)]
+}
+
+function cacheKey(url: URL, version: string): string {
   const params = [...url.searchParams.entries()].filter(([k]) => k !== 'refresh').sort(([a], [b]) => a.localeCompare(b))
-  return `${viewPrefix(url, gen)}${url.pathname}?${new URLSearchParams(params)}`
+  return `${viewPrefix(url)}${url.pathname}@${version}?${new URLSearchParams(params)}`
+}
+
+// Internal: the container keeps finished image stacks here (backend/app/store.py), so a new
+// container generation loads them instead of rebuilding them from the archive. Shared key only.
+async function store(request: Request, env: Env, name: string): Promise<Response> {
+  if (!env.IRSA_PROXY_KEY || request.headers.get('x-proxy-key') !== env.IRSA_PROXY_KEY) {
+    return new Response('Forbidden', { status: 403 })
+  }
+  if (!/^jobs\/[A-Za-z0-9_-]{1,64}\.(json|npz)\.(meta|\d{1,3})$/.test(name)) return new Response('Not found', { status: 404 })
+  const key = `store/${name}`
+  if (request.method === 'PUT') {
+    if (!Number.isFinite(Number(request.headers.get('content-length') ?? NaN))) return new Response('Length required', { status: 411 })
+    await env.CACHE.put(key, request.body)
+    return new Response('ok')
+  }
+  if (request.method === 'GET') {
+    const obj = await env.CACHE.get(key)
+    if (!obj) return new Response('Not found', { status: 404 })
+    return new Response(obj.body, { headers: { 'content-type': 'application/octet-stream', 'content-length': String(obj.size) } })
+  }
+  return new Response('Method not allowed', { status: 405 })
 }
 
 async function forgetView(bucket: R2Bucket, prefix: string): Promise<void> {
@@ -86,12 +114,14 @@ export default {
     const put = url.pathname.match(/^\/api\/datasets\/([^/]+)\/files\/([^/]+)$/)
     if (put && request.method === 'PUT') return putFile(request, env, put[1], decodeURIComponent(put[2]))
     if (url.pathname.startsWith('/api/_upload/')) return readUpload(request, env, url.pathname.slice('/api/_upload/'.length))
+    if (url.pathname.startsWith('/api/_store/')) return store(request, env, url.pathname.slice('/api/_store/'.length))
     if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 })
 
-    const cacheable = CACHEABLE.has(url.pathname)
-    const key = cacheKey(url, env.CONTAINER_GEN)
+    const version = resultVersion(url, env)
+    const cacheable = CACHEABLE.has(url.pathname) && version !== undefined
+    const key = cacheKey(url, version ?? '')
     const refresh = url.pathname === '/api/frames' && ['1', 'true'].includes(url.searchParams.get('refresh') ?? '')
-    if (refresh) await forgetView(env.CACHE, viewPrefix(url, env.CONTAINER_GEN))
+    if (refresh) await forgetView(env.CACHE, viewPrefix(url))
     if (cacheable && !refresh) {
       const hit = await env.CACHE.get(key)
       const saved = Number(hit?.customMetadata?.saved ?? 0)
@@ -106,11 +136,10 @@ export default {
     await container.startAndWaitForPorts()
     const res = await container.fetch(request)
 
-    // Store only finished results; in-progress responses change on every poll.
-    // Store only finished results from current backend code. During a rollout a new-generation
-    // container can briefly run the previous image; that code does not send X-Backend-Gen, so its
-    // answers are never cached under the new generation's keys.
-    if (cacheable && res.ok && res.headers.get('x-complete') === 'true' && res.headers.get('x-backend-gen') === env.CONTAINER_GEN) {
+    // Store only finished results (in-progress responses change on every poll), and only when the
+    // backend says it produced the version this key is for: during a rollout an older image can
+    // still answer, and its results must not be cached as the new version.
+    if (cacheable && res.ok && res.headers.get('x-complete') === 'true' && res.headers.get('x-result-version') === version) {
       const body = await res.arrayBuffer()
       ctx.waitUntil(env.CACHE.put(key, body, {
         httpMetadata: { contentType: 'application/json' },

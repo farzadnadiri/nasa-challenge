@@ -44,6 +44,13 @@ a fallback.
 - Containers roll over slowly. Bump `CONTAINER_GEN` in `worker/wrangler.jsonc` together with
   `BACKEND_GEN` in `backend/app/config.py` (a test checks they match) whenever the
   backend changes, so requests go to a fresh container running the new image.
+- A new container generation does not empty the caches. API responses in R2 are keyed by
+  `RESULT_VERSIONS` (one version per kind of result, in both `backend/app/config.py` and
+  `worker/wrangler.jsonc`; a test checks they match): bump only the kind whose output changed,
+  e.g. `movers` after a detection change. Finished image stacks are kept in R2 under `store/`
+  (through the Worker's internal `/api/_store/` route, same secret as the IRSA proxy), so a new
+  container loads a view in seconds instead of rebuilding it from the archive. Changing
+  `PIPELINE_VERSION` (image processing) renews everything.
 - `GET /api/health` reports the pipeline version and whether the proxy is configured;
   `GET /api/diag` times each upstream from inside the container.
 
