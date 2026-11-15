@@ -8,8 +8,9 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from . import config, gaia, jobs
+from . import catwise, config, gaia, jobs
 from .cutouts import make_grid
+from .movers import find_movers
 from .uploads import UploadError
 from .irsa import UpstreamError, available_releases, pick_releases, resolve_collections, valid_release
 from .resolve import resolve as resolve_query
@@ -22,6 +23,10 @@ def _b64(a: np.ndarray | None) -> str | None:
     if a is None:
         return None
     return base64.b64encode(np.ascontiguousarray(a, dtype="<f4").tobytes()).decode()
+
+
+def _b64u8(a: np.ndarray | None) -> str | None:
+    return None if a is None else base64.b64encode(np.ascontiguousarray(a, dtype=np.uint8).tobytes()).decode()
 
 
 def _detectors(s: str) -> list[int]:
@@ -168,17 +173,51 @@ def frames(
     if job.status in ("fetching", "done") and job.metas:
         if mode == "epoch":
             for f in jobs.epoch_frames(job, wl_min, wl_max):
-                img = f.pop("image")
-                body["frames"].append({**f, "image": _b64(_cut(img, n, off))})
+                img, cm = f.pop("image"), f.pop("contam")
+                body["frames"].append({**f, "image": _b64(_cut(img, n, off)), "contam": _b64u8(_cut(cm, n, off))})
         elif mode == "wavelength":
             for f in jobs.wavelength_frames(job):
-                img = f.pop("image")
-                body["frames"].append({**f, "image": _b64(_cut(img, n, off))})
+                img, cm = f.pop("image"), f.pop("contam")
+                body["frames"].append({**f, "image": _b64(_cut(img, n, off)), "contam": _b64u8(_cut(cm, n, off))})
         else:
             for f in jobs.exposure_frames(job, wl_min, wl_max):
-                body["frames"].append({"meta": f["meta"], "image": _b64(_cut(f["image"], n, off))})
+                body["frames"].append({"meta": f["meta"], "image": _b64(_cut(f["image"], n, off)),
+                                       "contam": _b64u8(_cut(f["contam"], n, off))})
     # A refresh request is never cached; the Worker clears this view's stored results instead.
     return _cached_response(body, complete and not refresh)
+
+
+@app.get("/api/catwise")
+def catwise_cone(ra: float = Query(..., ge=0, le=360), dec: float = Query(..., ge=-90, le=90),
+                 radius: float = Query(0.08, gt=0, le=0.5)):
+    """CatWISE2020 (WISE) sources for the overlay; positions at 2015.4, proper motions in mas/yr."""
+    try:
+        return _cached_response(catwise.cone(ra, dec, radius), True)
+    except UpstreamError as e:
+        raise HTTPException(503, str(e))
+
+
+@app.get("/api/movers")
+def movers_endpoint(
+    ra: float | None = Query(None, ge=0, le=360),
+    dec: float | None = Query(None, ge=-90, le=90),
+    fov: float = Query(0.1),
+    dets: str = Query("5,6"),
+    release: str = RELEASE_Q,
+    deep: bool = DEEP_Q,
+    dataset: str | None = DATASET_Q,
+    debug: bool = Query(False, description="also return every linked track with its fit"),
+):
+    """Moving sources found across the epochs; 'candidate' = no Gaia star moving with it."""
+    job = _view_job(ra, dec, fov, dets, release, deep, dataset)
+    if job.status != "done":
+        return _cached_response({"status": job.status, "error": job.error, "movers": []}, False)
+    if debug:
+        return _cached_response({"status": "done", **find_movers(job, jobs.epoch_frames(job), debug=True)}, False)
+    if job.movers is None:
+        job.movers = find_movers(job, jobs.epoch_frames(job))
+    # Positions are sky coordinates, so the client places them in whatever field it shows.
+    return _cached_response({"status": "done", **job.movers}, True)
 
 
 @app.get("/api/releases")

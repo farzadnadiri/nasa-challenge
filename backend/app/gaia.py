@@ -41,6 +41,27 @@ def simbad_names(source_ids: list[str]) -> dict[str, dict]:
     return out
 
 
+def _vizier_cone(ra: float, dec: float, radius_deg: float, max_rows: int) -> list[dict]:
+    """Gaia DR3 (I/355/gaiadr3, positions at epoch 2016.0) from the CfA VizieR mirror."""
+    params = {"-source": "I/355/gaiadr3", "-c": f"{ra:.6f} {dec:+.6f}", "-c.rd": f"{radius_deg:.5f}",
+              "-out": "Source,RA_ICRS,DE_ICRS,pmRA,pmDE,Plx,Gmag,BP-RP", "-out.max": str(max_rows), "-sort": "Gmag"}
+    try:
+        r = httpx.get(config.VIZIER_ASU, params=params, timeout=60)
+        r.raise_for_status()
+    except httpx.HTTPError as e:
+        raise UpstreamError(f"Gaia archive unavailable (ESA and VizieR): {e}")
+    lines = [ln for ln in r.text.splitlines() if ln and not ln.startswith("#")]
+    out = []
+    for ln in lines[3:]:  # header, units, dashes
+        f = [x.strip() for x in ln.split("\t")]
+        if len(f) < 8 or not f[0].isdigit():
+            continue
+        num = lambda v: float(v) if v not in ("", "--") else None  # noqa: E731
+        out.append({"source_id": f[0], "ra": float(f[1]), "dec": float(f[2]), "pmra": num(f[3]), "pmdec": num(f[4]),
+                    "parallax": num(f[5]), "phot_g_mean_mag": num(f[6]), "bp_rp": num(f[7])})
+    return out
+
+
 def cone(ra: float, dec: float, radius_deg: float, max_rows: int = 3000) -> dict:
     r = radius_deg + MAX_PM_MARGIN_DEG
     adql = f"""
@@ -50,14 +71,14 @@ WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra:.7f}, {dec:.7f}, {
 ORDER BY phot_g_mean_mag ASC
 """
     try:
-        resp = httpx.post(config.GAIA_TAP, data={"REQUEST": "doQuery", "LANG": "ADQL",
-                                                 "FORMAT": "json", "QUERY": adql}, timeout=90)
+        resp = httpx.post(config.GAIA_TAP, data={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "json", "QUERY": adql},
+                          timeout=httpx.Timeout(connect=8, read=60, write=10, pool=10))
         resp.raise_for_status()
-    except httpx.HTTPError as e:
-        raise UpstreamError(f"Gaia archive unavailable: {e}")
-    d = resp.json()
-    cols = [c["name"] for c in d["metadata"]]
-    rows = [dict(zip(cols, row)) for row in d["data"]]
+        d = resp.json()
+        cols = [c["name"] for c in d["metadata"]]
+        rows = [dict(zip(cols, row)) for row in d["data"]]
+    except (httpx.HTTPError, ValueError, KeyError):
+        rows = _vizier_cone(ra, dec, r, max_rows)  # ESA archive down: same catalogue from VizieR
     for row in rows:
         row["source_id"] = str(row["source_id"])  # 64-bit ints lose precision in JS
     names = simbad_names([row["source_id"] for row in rows[:NAMED_SOURCES]])

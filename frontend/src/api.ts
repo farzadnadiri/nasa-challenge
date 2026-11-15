@@ -38,6 +38,8 @@ export interface Frame {
   nContaminated: number
   meta?: ExposureMeta
   channel?: { detector: number; channel: number; nEpochs: number }
+  contam?: Uint8Array | null              // per pixel: share of exposures flagged as contaminated (0-255)
+  flagCounts?: Record<string, number>     // contamination flag at the target -> number of exposures
 }
 
 export interface Grid {
@@ -152,6 +154,14 @@ async function getJSON<T>(url: string, signal?: AbortSignal): Promise<T> {
   return r.json() as Promise<T>
 }
 
+function decodeU8(b64: string | null | undefined): Uint8Array | null {
+  if (!b64) return null
+  const bin = atob(b64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}
+
 function decode(b64: string | null): Float32Array | null {
   if (!b64) return null
   const bin = atob(b64)
@@ -193,6 +203,8 @@ export async function fetchFrames(p: ViewParams, signal?: AbortSignal, refresh =
         shallow: false,
         wavelength: f.wavelength_min_um != null ? [f.wavelength_min_um, f.wavelength_max_um] : null,
         nContaminated: f.n_contaminated ?? 0,
+        contam: decodeU8(f.contam),
+        flagCounts: f.flag_counts ?? {},
         channel: { detector: f.detector, channel: f.channel, nEpochs: f.n_epochs },
       }
     }
@@ -207,6 +219,8 @@ export async function fetchFrames(p: ViewParams, signal?: AbortSignal, refresh =
         shallow: !!f.shallow,
         wavelength: f.wavelength_min_um != null ? [f.wavelength_min_um, f.wavelength_max_um] : null,
         nContaminated: f.n_contaminated ?? 0,
+        contam: decodeU8(f.contam),
+        flagCounts: f.flag_counts ?? {},
       }
     }
     const m: ExposureMeta = f.meta
@@ -220,6 +234,8 @@ export async function fetchFrames(p: ViewParams, signal?: AbortSignal, refresh =
       shallow: false,
       wavelength: m.wavelength_um != null ? [m.wavelength_um, m.wavelength_um] : null,
       nContaminated: m.contaminated ? 1 : 0,
+      contam: decodeU8(f.contam),
+      flagCounts: Object.fromEntries(m.target_flags.filter((x) => CONTAMINATION_FLAGS[x]).map((x) => [x, 1])),
       meta: m,
     }
   })
@@ -227,6 +243,32 @@ export async function fetchFrames(p: ViewParams, signal?: AbortSignal, refresh =
 }
 
 export const resolveTarget = (q: string) => getJSON<Resolved>(`/api/resolve?q=${encodeURIComponent(q)}`)
+
+// What each SPHEREx contamination flag means (from the FLAGS extension of the spectral images).
+export const CONTAMINATION_FLAGS: Record<string, string> = {
+  GHOST: 'optical ghost of a bright source in the same exposure',
+  GHOST_FPA: 'ghost of a bright source on another detector',
+  GHOST_EXT: 'stray light from a bright source outside the field',
+  STREAK: 'streak across the image (for example a satellite)',
+  HALO: 'transient halo around a bright source',
+  CROSSTALK: 'electronic crosstalk from a bright source',
+}
+
+export interface CatwiseSource {
+  name: string
+  ra: number
+  dec: number
+  pmra: number | null   // mas/yr
+  pmdec: number | null
+  w1: number | null
+  w2: number | null
+  w1_w2: number | null
+}
+
+export const fetchCatwise = (ra: number, dec: number, radius: number) =>
+  getJSON<{ ref_epoch: number; sources: CatwiseSource[] }>(
+    `/api/catwise?ra=${ra.toFixed(6)}&dec=${dec.toFixed(6)}&radius=${radius.toFixed(4)}`,
+  )
 
 export const fetchGaia = (ra: number, dec: number, radius: number) =>
   getJSON<{ ref_epoch: number; sources: GaiaSource[] }>(
@@ -237,6 +279,34 @@ export interface ExposureRow extends ExposureMeta {
   saturated: boolean
   source?: string
 }
+
+export interface Mover {
+  status: 'candidate' | 'known'
+  ra: number
+  dec: number
+  year_mid: number
+  pmra_mas_yr: number
+  pmdec_mas_yr: number
+  pm_arcsec_yr: number
+  significance: number
+  chi2_red: number
+  n_epochs: number
+  snr: number
+  saturated: boolean
+  gaia: { source_id: string; name: string | null; pm_arcsec_yr: number; g_mag: number | null } | null
+  positions: { epoch: number; year: number; ra: number; dec: number }[]
+}
+
+export interface MoversResult {
+  status: string
+  movers: Mover[]
+  n_epochs: number
+  n_tracks?: number
+  gaia_checked?: boolean
+  note?: string
+}
+
+export const fetchMovers = (p: ViewParams) => getJSON<MoversResult>(`/api/movers?${qs(p)}`)
 
 export const fetchExposures = (p: ViewParams) =>
   getJSON<{ status: string; exposures: ExposureRow[] }>(`/api/exposures?${qs(p)}`)

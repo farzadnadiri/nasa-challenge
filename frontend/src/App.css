@@ -127,10 +127,6 @@ input[type='checkbox'] { accent-color: var(--accent); }
 footer { margin-top: 28px; padding-top: 12px; border-top: 1px solid var(--border); }
 
 /* A minus B pickers */
-.ab-pick { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: end; gap: 6px; }
-.ab-pick label { font-size: 0.8rem; color: var(--text-secondary); }
-.ab-pick select { width: 100%; padding: 6px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); }
-.ab-minus { font-size: 1.3rem; padding-bottom: 4px; color: var(--text-secondary); }
 
 /* Exposure metadata */
 .meta-section { margin-top: 20px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-1); padding: 10px 14px; }
@@ -199,3 +195,22 @@ footer { margin-top: 28px; padding-top: 12px; border-top: 1px solid var(--border
 .controls .upload-list .up-status { grid-column: 1 / -1; font-size: 0.78rem; }
 .data-note { margin: 0; }
 .export-btn { width: 100%; justify-content: center; }
+
+/* Moving sources */
+.movers-section { margin-top: 20px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-1); }
+.movers-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.movers-head h2 { margin: 0; font-size: 1.05rem; }
+.movers-how { margin: 6px 0 10px; }
+.tag-cand { border-color: rgb(255, 79, 216); color: rgb(255, 79, 216); font-weight: 600; }
+.movers-table tr.clickable { cursor: pointer; }
+.movers-table tr.clickable:hover td { background: var(--surface-2); }
+
+/* Add / Subtract: choose frames */
+.combine { display: grid; gap: 4px; }
+.combine-label { font-size: 0.8rem; color: var(--text-secondary); }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.epoch-chip { display: inline-flex; flex-direction: column; align-items: center; padding: 3px 8px; line-height: 1.15; font-size: 0.82rem; }
+.epoch-chip small { color: var(--text-muted); font-size: 0.68rem; }
+.epoch-chip.on { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.epoch-chip.minus.on { border-color: var(--series-1); box-shadow: inset 0 0 0 1px var(--series-1); }
+.flag-name { text-decoration: underline dotted; cursor: help; }

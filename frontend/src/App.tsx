@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import {
-  fetchFrames, fetchGaia, fetchPhotometry, fetchReleases, resolveTarget,
-  type Frame, type FramesResult, type GaiaSource, type PhotPoint, type Releases, type Resolved, type ViewMode, type ViewParams,
+  CONTAMINATION_FLAGS, fetchCatwise, fetchFrames, fetchGaia, fetchMovers, fetchPhotometry, fetchReleases, resolveTarget,
+  type CatwiseSource, type Frame, type FramesResult, type GaiaSource, type Mover, type MoversResult, type PhotPoint, type Releases, type Resolved, type ViewMode, type ViewParams,
 } from './api'
 import { PhotometryCharts } from './components/Charts'
 import { ExposureTable } from './components/ExposureTable'
+import { MoversPanel } from './components/MoversPanel'
 import { REF_SOURCES, Reference, type RefSource } from './components/Reference'
 import { UploadPanel } from './components/UploadPanel'
 import { Viewer } from './components/Viewer'
@@ -78,9 +79,16 @@ export default function App() {
   // ?embed=1: just the viewer and a minimal bar, for <iframe> embedding on other sites.
   const embed = useMemo(() => new URLSearchParams(location.search).get('embed') === '1', [])
   // Images | Difference (each frame minus the mean) | A minus B (two chosen frames).
-  const [imageType, setImageType] = useState<'frames' | 'difference' | 'ab'>('frames')
-  const [abA, setAbA] = useState(-1)
-  const [abB, setAbB] = useState(0)
+  // Images | Difference | A minus B | A plus B (two chosen frames added: a deeper image).
+  // Images | Difference (each frame minus the average) | Add (stack chosen frames: deeper image)
+  // | Subtract (stack of one chosen set minus stack of another: what changed between them).
+  const [imageType, setImageType] = useState<'frames' | 'difference' | 'add' | 'subtract'>('frames')
+  const [addSet, setAddSet] = useState<number[] | null>(null)  // indices into the shown frames; null = all
+  const [plusSet, setPlusSet] = useState<number[] | null>(null)  // null = last frame
+  const [minusSet, setMinusSet] = useState<number[] | null>(null) // null = first frame
+  const [showWise, setShowWise] = useState(true)
+  const [catwise, setCatwise] = useState<CatwiseSource[] | null>(null)
+  const [showContam, setShowContam] = useState(false)
   const [result, setResult] = useState<FramesResult | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -95,6 +103,10 @@ export default function App() {
   const [photMode, setPhotMode] = useState<'aperture' | 'wing'>('aperture')
   const [photUnit, setPhotUnit] = useState('mJy')
   const [showUpload, setShowUpload] = useState(false)
+  // Moving-source search (our discovery feature): on by default, runs once the frames are ready.
+  const [findMovers, setFindMovers] = useState(true)
+  const [moversRes, setMoversRes] = useState<MoversResult | null>(null)
+  const [moversLoading, setMoversLoading] = useState(false)
   // The archive view to return to after looking at an uploaded dataset.
   const archiveParams = useRef<ViewParams | null>(null)
   const [gaia, setGaia] = useState<GaiaSource[] | null>(null)
@@ -220,6 +232,29 @@ export default function App() {
     return () => { live = false }
   }, [params, showGaia, gRa, gDec]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ---- WISE (CatWISE2020) overlay
+  useEffect(() => {
+    if (!params || !showWise || gRa == null || gDec == null || !Number.isFinite(gRa)) return
+    let live = true
+    fetchCatwise(gRa, gDec, params.fov * 0.75)
+      .then((c) => live && setCatwise(c.sources))
+      .catch(() => live && setCatwise(null))
+    return () => { live = false }
+  }, [params, showWise, gRa, gDec]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ---- moving sources, once all exposures are in
+  useEffect(() => {
+    setMoversRes(null)
+    if (!params || !findMovers || result?.status !== 'done') return
+    let live = true
+    setMoversLoading(true)
+    fetchMovers(params)
+      .then((r) => live && setMoversRes(r))
+      .catch(() => live && setMoversRes(null))
+      .finally(() => live && setMoversLoading(false))
+    return () => { live = false }
+  }, [params, findMovers, result?.status]) // eslint-disable-line react-hooks/exhaustive-deps
+
   // ---- frames actually shown (shallow epochs are noisy and patchy)
   const frames = useMemo(
     () => (result?.frames ?? []).filter((f) => !(skipShallow && f.shallow) && f.data),
@@ -230,20 +265,38 @@ export default function App() {
     () => (skipShallow && mode === 'epoch' ? (result?.frames ?? []).filter((f) => f.shallow && f.data) : []),
     [result, skipShallow, mode],
   )
-  // A minus B: indices into the shown frames (A defaults to the last, B to the first).
-  const aIdx = frames.length ? (abA < 0 || abA >= frames.length ? frames.length - 1 : abA) : 0
-  const bIdx = frames.length ? Math.min(abB, frames.length - 1) : 0
-  const abActive = imageType === 'ab' && frames.length >= 2
+  // Add / Subtract: stacks of chosen frames (pixel-wise mean, ignoring masked pixels).
+  const valid = (ix: number[] | null, fallback: number[]) =>
+    (ix ?? fallback).filter((i) => i >= 0 && i < frames.length && frames[i].data)
+  const addIdx = valid(addSet, frames.map((_, i) => i))
+  const plusIdx = valid(plusSet, frames.length ? [frames.length - 1] : [])
+  const minusIdx = valid(minusSet, frames.length ? [0] : []).filter((i) => !plusIdx.includes(i))
+  const combineActive = (imageType === 'add' && addIdx.length >= 2) || (imageType === 'subtract' && plusIdx.length >= 1 && minusIdx.length >= 1)
   const viewFrames: Frame[] = useMemo(() => {
-    if (!abActive) return frames
-    const A = frames[aIdx], B = frames[bIdx]
-    const data = A.data && B.data ? A.data.map((v, i) => v - B.data![i]) : null
-    return [{ ...A, label: `${A.label} − ${B.label}`, date: `${A.date} minus ${B.date}`, data, meta: undefined }]
-  }, [abActive, frames, aIdx, bIdx])
+    if (!combineActive) return frames
+    const stack = (ix: number[]) => {
+      const n = frames[ix[0]].data!.length
+      const sum = new Float32Array(n), cnt = new Uint16Array(n)
+      for (const i of ix) {
+        const d = frames[i].data!
+        for (let k = 0; k < n; k++) if (Number.isFinite(d[k])) { sum[k] += d[k]; cnt[k]++ }
+      }
+      for (let k = 0; k < n; k++) sum[k] = cnt[k] ? sum[k] / cnt[k] : NaN
+      return sum
+    }
+    const names = (ix: number[]) => ix.map((i) => frames[i].label.replace('Epoch ', 'E')).join(' + ')
+    const base = frames[(imageType === 'add' ? addIdx : plusIdx)[0]]
+    if (imageType === 'add') {
+      return [{ ...base, label: `Added: ${names(addIdx)}`, date: `${addIdx.length} frames stacked`, data: stack(addIdx), meta: undefined, contam: null }]
+    }
+    const pl = stack(plusIdx), mi = stack(minusIdx)
+    const data = pl.map((v, k) => v - mi[k])
+    return [{ ...base, label: `Subtracted: (${names(plusIdx)}) − (${names(minusIdx)})`, date: `${frames[plusIdx[0]].date} vs ${frames[minusIdx[0]].date}`, data, meta: undefined, contam: null }]
+  }, [combineActive, imageType, frames, addIdx.join(), plusIdx.join(), minusIdx.join()]) // eslint-disable-line react-hooks/exhaustive-deps
   // Memoised: the viewer re-renders every frame bitmap when this object changes.
   const viewStretch: StretchOpts = useMemo(
-    () => ({ ...stretch, display: abActive ? 'signed' : imageType === 'difference' ? 'difference' : 'frames' }),
-    [stretch, abActive, imageType],
+    () => ({ ...stretch, display: combineActive && imageType === 'subtract' ? 'signed' : imageType === 'difference' ? 'difference' : 'frames' }),
+    [stretch, combineActive, imageType],
   )
   useEffect(() => { setIndex((i) => (viewFrames.length ? i % viewFrames.length : 0)) }, [viewFrames.length])
 
@@ -351,7 +404,9 @@ export default function App() {
             <div className="panes">
               <div className="pane">
               <Viewer grid={grid} frames={viewFrames} index={index} stretch={viewStretch} smooth={smooth}
-                gaia={showGaia ? gaia : null} gaiaEpoch={2016.0} pick={pick} onPick={onPick} onHover={setHover} />
+                gaia={showGaia ? gaia : null} gaiaEpoch={2016.0} movers={findMovers ? moversRes?.movers : null}
+                catwise={showWise ? catwise : null} catwiseEpoch={2015.4} showContam={showContam}
+                pick={pick} onPick={onPick} onHover={setHover} />
               {/* What the markers on the image mean; entries appear only when that marker is shown. */}
               <div className="viewer-legend" aria-label="Image markers">
                 <span className="vl-item">
@@ -370,6 +425,30 @@ export default function App() {
                     </span>
                   </>
                 )}
+                {showWise && catwise && catwise.length > 0 && (
+                  <span className="vl-item">
+                    <svg width="18" height="18" aria-hidden="true"><rect x="4" y="4" width="10" height="10" fill="none" stroke="rgb(255,169,77)" strokeWidth="1.8" /></svg>
+                    WISE source (CatWISE2020), moved to this frame's date; thick = very red
+                  </span>
+                )}
+                {showContam && (
+                  <span className="vl-item">
+                    <svg width="18" height="18" aria-hidden="true"><rect x="2" y="2" width="14" height="14" fill="rgba(255,140,0,0.5)" /></svg>
+                    Pixels flagged as contaminated (ghost, streak, halo, crosstalk)
+                  </span>
+                )}
+                {findMovers && (moversRes?.movers.length ?? 0) > 0 && (
+                  <>
+                    <span className="vl-item">
+                      <svg width="18" height="18" aria-hidden="true"><path d="M9 2 16 9 9 16 2 9Z" fill="none" stroke="rgb(255,79,216)" strokeWidth="2" /></svg>
+                      New moving-source candidate (no Gaia match)
+                    </span>
+                    <span className="vl-item">
+                      <svg width="18" height="18" aria-hidden="true"><path d="M9 3 15 9 9 15 3 9Z" fill="none" stroke="rgb(255,79,216)" strokeWidth="1.6" strokeDasharray="3 3" /></svg>
+                      Moving source matched to Gaia
+                    </span>
+                  </>
+                )}
                 {pick && (
                   <span className="vl-item">
                     <svg width="18" height="18" aria-hidden="true"><circle cx="9" cy="9" r="7" fill="none" stroke="rgb(0,255,140)" strokeWidth="1.8" /></svg>
@@ -380,9 +459,13 @@ export default function App() {
               <div className="frame-info">
                 <strong>{frame?.label}</strong> · {frame?.date}
                 {frame?.wavelength && ` · ${frame.wavelength[0].toFixed(2)}${frame.wavelength[1] !== frame.wavelength[0] ? `–${frame.wavelength[1].toFixed(2)}` : ''} µm`}
-                {mode === 'epoch' && frame && !abActive && ` · ${frame.nUsed} exposures`}
-                {mode === 'wavelength' && frame?.channel && !abActive && ` · ${frame.nUsed} exposures from ${frame.channel.nEpochs} epochs`}
-                {frame && frame.nContaminated > 0 && <span className="warn"> · {frame.nContaminated} flagged</span>}
+                {mode === 'epoch' && frame && !combineActive && ` · ${frame.nUsed} exposures`}
+                {mode === 'wavelength' && frame?.channel && !combineActive && ` · ${frame.nUsed} exposures from ${frame.channel.nEpochs} epochs`}
+                {frame && Object.keys(frame.flagCounts ?? {}).length > 0 && (
+                  <span className="warn"> · Contamination at target: {Object.entries(frame.flagCounts!).map(([f, n], i) => (
+                    <span key={f} title={CONTAMINATION_FLAGS[f] ?? f} className="flag-name">{i ? ', ' : ''}{f}{mode !== 'exposure' ? ` in ${n} of ${frame.nUsed}` : ''}</span>
+                  ))}</span>
+                )}
                 {frame?.meta?.target_flags.length ? <span className="muted"> · flags: {frame.meta.target_flags.join(', ')}</span> : null}
               </div>
               <div className="cursor muted">
@@ -395,7 +478,7 @@ export default function App() {
                 </div>
               )}
 
-              {frames.length > 0 && !abActive && (
+              {frames.length > 0 && !combineActive && (
                 <div className="strip">
                   {frames.map((f, i) => (
                     <button key={i} className={`thumb ${i === index ? 'active' : ''}`} onClick={() => { setPlaying(false); setIndex(i) }}>
@@ -405,7 +488,7 @@ export default function App() {
                   ))}
                 </div>
               )}
-              {hiddenShallow.length > 0 && !abActive && (
+              {hiddenShallow.length > 0 && !combineActive && (
                 <p className="muted small hidden-note">
                   {hiddenShallow.map((f) => f.label.replace('Epoch ', 'E')).join(', ')} hidden: too few exposures
                   ({hiddenShallow.map((f) => f.nUsed).join(' and ')}).{' '}
@@ -486,21 +569,48 @@ export default function App() {
             <div className="seg" role="group" aria-label="Image type">
               <button aria-pressed={imageType === 'frames'} className={imageType === 'frames' ? 'on' : ''} onClick={() => setImageType('frames')}>Images</button>
               <button aria-pressed={imageType === 'difference'} className={imageType === 'difference' ? 'on' : ''} onClick={() => setImageType('difference')}>Difference</button>
-              <button aria-pressed={imageType === 'ab'} className={imageType === 'ab' ? 'on' : ''} onClick={() => setImageType('ab')}>A − B</button>
+              <button aria-pressed={imageType === 'add'} className={imageType === 'add' ? 'on' : ''} onClick={() => setImageType('add')}>Add</button>
+              <button aria-pressed={imageType === 'subtract'} className={imageType === 'subtract' ? 'on' : ''} onClick={() => setImageType('subtract')}>Subtract</button>
             </div>
-            {imageType === 'ab' && frames.length >= 2 && (
-              <div className="ab-pick">
-                <label>A
-                  <select value={aIdx} onChange={(e) => setAbA(+e.target.value)}>
-                    {frames.map((f, i) => <option key={i} value={i}>{f.label} · {f.date.slice(0, 16)}</option>)}
-                  </select>
-                </label>
-                <span className="ab-minus" aria-hidden="true">−</span>
-                <label>B
-                  <select value={bIdx} onChange={(e) => setAbB(+e.target.value)}>
-                    {frames.map((f, i) => <option key={i} value={i}>{f.label} · {f.date.slice(0, 16)}</option>)}
-                  </select>
-                </label>
+            {imageType === 'add' && frames.length >= 2 && (
+              <div className="combine">
+                <span className="combine-label">Frames to add</span>
+                <div className="chips">
+                  {frames.map((f, i) => (
+                    <button key={i} aria-pressed={addIdx.includes(i)} className={`epoch-chip ${addIdx.includes(i) ? 'on' : ''}`}
+                      onClick={() => setAddSet(addIdx.includes(i) ? addIdx.filter((x) => x !== i) : [...addIdx, i].sort((x, y) => x - y))}>
+                      {f.label.replace('Epoch ', 'E')}<small>{f.date.slice(0, 10)}</small>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {imageType === 'subtract' && frames.length >= 2 && (
+              <div className="combine">
+                <span className="combine-label">From</span>
+                <div className="chips">
+                  {frames.map((f, i) => (
+                    <button key={i} aria-pressed={plusIdx.includes(i)} className={`epoch-chip ${plusIdx.includes(i) ? 'on' : ''}`}
+                      onClick={() => {
+                        setPlusSet(plusIdx.includes(i) ? plusIdx.filter((x) => x !== i) : [...plusIdx, i].sort((x, y) => x - y))
+                        setMinusSet(minusIdx.filter((x) => x !== i))
+                      }}>
+                      {f.label.replace('Epoch ', 'E')}<small>{f.date.slice(0, 10)}</small>
+                    </button>
+                  ))}
+                </div>
+                <span className="combine-label">Subtract</span>
+                <div className="chips">
+                  {frames.map((f, i) => (
+                    <button key={i} aria-pressed={minusIdx.includes(i)} className={`epoch-chip minus ${minusIdx.includes(i) ? 'on' : ''}`}
+                      onClick={() => {
+                        setMinusSet(minusIdx.includes(i) ? minusIdx.filter((x) => x !== i) : [...minusIdx, i].sort((x, y) => x - y))
+                        setPlusSet(plusIdx.filter((x) => x !== i))
+                      }}>
+                      {f.label.replace('Epoch ', 'E')}<small>{f.date.slice(0, 10)}</small>
+                    </button>
+                  ))}
+                </div>
               </div>
             )}
             <p className="muted small seg-hint">
@@ -510,9 +620,13 @@ export default function App() {
                   ? 'Each frame minus the average: still stars vanish, movers show as dark/light pairs.'
                   : frames.length < 2
                     ? 'Needs at least two frames.'
-                    : mode === 'wavelength'
-                      ? 'One channel minus another: a colour image. Sources brighter at A than at B stay light, the rest go dark.'
-                      : 'Frame A minus frame B: what changed between the two. A mover shows as a light/dark pair.'}
+                    : imageType === 'add'
+                      ? (addIdx.length < 2 ? 'Choose at least two frames to add.' : 'The chosen frames stacked: a deeper image, so fainter sources show. A moving source appears once per frame.')
+                      : !combineActive
+                        ? 'Choose at least one frame on each side.'
+                        : mode === 'wavelength'
+                          ? 'Stack of the first set minus the second: a colour image. Sources brighter in the first set stay light.'
+                          : 'Stack of the first set minus the second: what changed between those times. A mover shows as a light/dark pair.'}
             </p>
           </fieldset>
 
@@ -625,10 +739,25 @@ export default function App() {
             <label className="check"><input type="checkbox" checked={stretch.invert} onChange={(e) => setStretch({ ...stretch, invert: e.target.checked })} /> Invert (dark stars)</label>
             <label className="check"><input type="checkbox" checked={smooth} onChange={(e) => setSmooth(e.target.checked)} /> Smooth pixels</label>
             <label className="check"><input type="checkbox" checked={skipShallow} onChange={(e) => setSkipShallow(e.target.checked)} /> Skip shallow epochs <small className="muted">(few exposures)</small></label>
+            <label className="check"><input type="checkbox" checked={findMovers} onChange={(e) => setFindMovers(e.target.checked)} /> Find moving sources <small className="muted">(candidates in magenta)</small></label>
+            <label className="check"><input type="checkbox" checked={showWise} onChange={(e) => setShowWise(e.target.checked)} /> WISE overlay <small className="muted">(CatWISE2020, orange squares)</small></label>
+            <label className="check"><input type="checkbox" checked={showContam} onChange={(e) => setShowContam(e.target.checked)} /> Show contamination map <small className="muted">(flagged pixels)</small></label>
             <label className="check"><input type="checkbox" checked={showGaia} onChange={(e) => setShowGaia(e.target.checked)} /> Gaia DR3 overlay <small className="muted">(moved to frame date)</small></label>
           </fieldset>
         </aside>
       </main>
+
+      {findMovers && params && result?.status === 'done' && mode === 'epoch' && (
+        <MoversPanel result={moversRes} loading={moversLoading} onSelect={(m: Mover) => {
+          if (!geom) return
+          const f = frames[index]
+          const dt = (f?.decimalYear ?? m.year_mid) - m.year_mid
+          const ra = m.ra + (m.pmra_mas_yr * dt) / 3.6e6 / Math.max(Math.cos((m.dec * Math.PI) / 180), 1e-6)
+          const dec = m.dec + (m.pmdec_mas_yr * dt) / 3.6e6
+          const p = skyToPixel(geom, ra, dec)
+          if (p) onPick(p[0], p[1])
+        }} />
+      )}
 
       {pick && (
         <section className="photometry">

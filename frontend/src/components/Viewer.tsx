@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { Frame, GaiaSource, Grid } from '../api'
+import type { CatwiseSource, Frame, GaiaSource, Grid, Mover } from '../api'
 import { computeLimits, displayFrames, renderToImageData, type StretchOpts } from '../render'
 import { propagate, skyToPixel, type GridGeom } from '../sky'
 
@@ -11,6 +11,10 @@ interface Props {
   smooth: boolean
   gaia: GaiaSource[] | null
   gaiaEpoch: number
+  catwise?: CatwiseSource[] | null
+  catwiseEpoch?: number
+  showContam?: boolean
+  movers?: Mover[] | null
   pick: [number, number] | null
   onPick: (x: number, y: number) => void
   onHover: (xy: [number, number] | null) => void
@@ -24,6 +28,25 @@ const OTYPES: Record<string, string> = {
   'BY*': 'BY Draconis variable', 'Mi*': 'Mira variable', 'TT*': 'T Tauri star', 'V*': 'variable star',
   'LP*': 'long-period variable', 'SB*': 'spectroscopic binary', 'EB*': 'eclipsing binary', 'RR*': 'RR Lyrae variable',
   'WD*': 'white dwarf', 'RG*': 'red giant', 'LM*': 'low-mass star', 'Ro*': 'rotating variable', 'G': 'galaxy', 'QSO': 'quasar',
+}
+
+function WiseTooltip({ src, x, y, size }: { src: CatwiseSource; x: number; y: number; size: number }) {
+  const pm = Math.hypot(src.pmra ?? 0, src.pmdec ?? 0)
+  const red = (src.w1_w2 ?? 0) >= 1.0
+  return (
+    <div className="star-tip" role="tooltip"
+      style={{ left: `${(x / size) * 100}%`, top: `${(y / size) * 100}%`,
+        transform: `translate(${x > size * 0.7 ? '-100%' : x < size * 0.3 ? '0' : '-50%'}, ${y < 120 ? '16px' : 'calc(-100% - 14px)'})` }}>
+      <div className="star-tip-name">CatWISE {src.name}</div>
+      <div className="star-tip-type">WISE infrared source{red ? ': very red, brown-dwarf-like colour' : ''}</div>
+      <dl>
+        {src.w1 != null && <><dt>W1 (3.4 µm)</dt><dd>{src.w1.toFixed(2)} mag</dd></>}
+        {src.w2 != null && <><dt>W2 (4.6 µm)</dt><dd>{src.w2.toFixed(2)} mag</dd></>}
+        {src.w1_w2 != null && <><dt>Colour</dt><dd>W1 − W2 = {src.w1_w2.toFixed(2)}{red ? ' (red)' : ''}</dd></>}
+        <dt>Motion</dt><dd>{(pm / 1000).toFixed(pm > 1000 ? 2 : 3)}″ per year{pm > 200 ? ' (fast)' : ''}</dd>
+      </dl>
+    </div>
+  )
 }
 
 function StarTooltip({ star, x, y, size }: { star: GaiaSource; x: number; y: number; size: number }) {
@@ -48,12 +71,13 @@ function StarTooltip({ star, x, y, size }: { star: GaiaSource; x: number; y: num
   )
 }
 
-export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, pick, onPick, onHover }: Props) {
+export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, catwise, catwiseEpoch = 2015.4, showContam, movers, pick, onPick, onHover }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
   // Gaia markers as drawn in the current frame (canvas CSS px), for hover lookups.
-  const markersRef = useRef<{ s: GaiaSource; cx: number; cy: number }[]>([])
-  const [hoverStar, setHoverStar] = useState<{ s: GaiaSource; x: number; y: number } | null>(null)
+  type Marker = { kind: 'gaia'; s: GaiaSource; cx: number; cy: number } | { kind: 'wise'; s: CatwiseSource; cx: number; cy: number }
+  const markersRef = useRef<Marker[]>([])
+  const [hoverStar, setHoverStar] = useState<Marker | null>(null)
   // Draw at the canvas's real on-screen size so text and lines stay crisp at any size.
   const [SIZE, setSize] = useState(640)
   useEffect(() => {
@@ -69,6 +93,28 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
   )
 
   // Pre-render every frame once per stretch change; blinking then only swaps bitmaps.
+  const contamBitmaps = useMemo(() => frames.map((f) => {
+    if (!f.contam || !grid.n || f.contam.length !== grid.n * grid.n) return null
+    const img = new ImageData(grid.n, grid.n)
+    let any = false
+    for (let y = 0; y < grid.n; y++) {
+      const src = (grid.n - 1 - y) * grid.n // FITS rows go south -> north
+      for (let x = 0; x < grid.n; x++) {
+        const v = f.contam[src + x]
+        if (!v) continue
+        any = true
+        const o = (y * grid.n + x) * 4
+        img.data[o] = 255; img.data[o + 1] = 140; img.data[o + 2] = 0
+        img.data[o + 3] = 70 + Math.round((v / 255) * 110)
+      }
+    }
+    if (!any) return null
+    const c = document.createElement('canvas')
+    c.width = c.height = grid.n
+    c.getContext('2d')!.putImageData(img, 0, 0)
+    return c
+  }), [frames, grid.n])
+
   const bitmaps = useMemo(() => {
     if (!grid.n) return []
     const shown = displayFrames(frames.map((f) => f.data), stretch.display)
@@ -96,6 +142,11 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
       ctx.imageSmoothingEnabled = smooth
       ctx.drawImage(bmp, 0, 0, SIZE, SIZE)
     }
+    const cbmp = showContam ? contamBitmaps[index] : null
+    if (cbmp) {
+      ctx.imageSmoothingEnabled = false
+      ctx.drawImage(cbmp, 0, 0, SIZE, SIZE)
+    }
     // grid pixel (FITS, y north) -> canvas coords (pixel centres)
     const toCanvas = (x: number, y: number): [number, number] => [(x + 0.5) * k, (grid.n - 0.5 - y) * k]
 
@@ -117,12 +168,63 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
         const [cx, cy] = toCanvas(p[0], p[1])
         if (cx < -10 || cy < -10 || cx > SIZE + 10 || cy > SIZE + 10) continue
         shown++
-        markersRef.current.push({ s, cx, cy })
+        markersRef.current.push({ kind: 'gaia', s, cx, cy })
         const fast = Math.hypot(pmra, pmdec) > 200
         ctx.strokeStyle = fast ? 'rgba(255, 92, 92, 0.95)' : 'rgba(80, 200, 255, 0.7)'
         ctx.beginPath()
         ctx.arc(cx, cy, fast ? 9 : 6, 0, Math.PI * 2)
         ctx.stroke()
+      }
+    }
+
+    // CatWISE2020 (WISE mission) sources: orange squares, moved from 2015.4 to this frame's date.
+    // A very red W1 - W2 colour (brown-dwarf-like) gets a thicker square.
+    if (catwise && frame) {
+      const dt = frame.decimalYear - catwiseEpoch
+      let shown = 0
+      for (const s of catwise) {
+        const fastMover = Math.hypot(s.pmra ?? 0, s.pmdec ?? 0) > 200
+        if (shown >= GAIA_MAX_MARKERS && !fastMover) continue
+        const [ra, dec] = propagate(s.ra, s.dec, s.pmra ?? 0, s.pmdec ?? 0, dt)
+        const p = skyToPixel(geom, ra, dec)
+        if (!p) continue
+        const [cx, cy] = toCanvas(p[0], p[1])
+        if (cx < -10 || cy < -10 || cx > SIZE + 10 || cy > SIZE + 10) continue
+        shown++
+        markersRef.current.push({ kind: 'wise', s, cx, cy })
+        const red = (s.w1_w2 ?? 0) >= 1.0
+        ctx.strokeStyle = 'rgba(255, 169, 77, 0.9)'
+        ctx.lineWidth = red ? 2.4 : 1.2
+        ctx.strokeRect(cx - 5, cy - 5, 10, 10)
+      }
+    }
+
+    // Moving sources: the measured track, and a diamond at this frame's date
+    // (magenta solid = new candidate with no Gaia match, dashed = matched to a Gaia star).
+    if (movers && frame) {
+      const dec0 = grid.dec * (Math.PI / 180)
+      for (const m of movers) {
+        const track = m.positions.map((p) => skyToPixel(geom, p.ra, p.dec)).filter((p): p is [number, number] => !!p)
+        ctx.strokeStyle = 'rgba(255, 79, 216, 0.35)'
+        ctx.lineWidth = 1.5
+        ctx.setLineDash([])
+        ctx.beginPath()
+        track.forEach(([x, y], i) => { const [cx, cy] = toCanvas(x, y); if (i) ctx.lineTo(cx, cy); else ctx.moveTo(cx, cy) })
+        ctx.stroke()
+        const dt = frame.decimalYear - m.year_mid
+        const ra = m.ra + (m.pmra_mas_yr * dt) / 3.6e6 / Math.max(Math.cos(dec0), 1e-6)
+        const dec = m.dec + (m.pmdec_mas_yr * dt) / 3.6e6
+        const p = skyToPixel(geom, ra, dec)
+        if (!p) continue
+        const [cx, cy] = toCanvas(p[0], p[1])
+        const r = m.status === 'candidate' ? 12 : 9
+        ctx.strokeStyle = 'rgba(255, 79, 216, 0.95)'
+        ctx.lineWidth = m.status === 'candidate' ? 2.2 : 1.6
+        ctx.setLineDash(m.status === 'candidate' ? [] : [3, 3])
+        ctx.beginPath()
+        ctx.moveTo(cx, cy - r); ctx.lineTo(cx + r, cy); ctx.lineTo(cx, cy + r); ctx.lineTo(cx - r, cy); ctx.closePath()
+        ctx.stroke()
+        ctx.setLineDash([])
       }
     }
 
@@ -175,7 +277,7 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
       ctx.fillStyle = 'rgba(255,255,255,0.95)'
       ctx.fillText(text, x, y)
     }
-  }, [bitmaps, index, smooth, gaia, gaiaEpoch, frames, geom, grid, pick, SIZE])
+  }, [bitmaps, contamBitmaps, showContam, index, smooth, gaia, gaiaEpoch, catwise, catwiseEpoch, movers, frames, geom, grid, pick, SIZE])
 
   const toGrid = (e: React.MouseEvent<HTMLCanvasElement>): [number, number] => {
     const r = e.currentTarget.getBoundingClientRect()
@@ -196,16 +298,17 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
           // Nearest drawn Gaia marker within 10 px of the pointer.
           const r = e.currentTarget.getBoundingClientRect()
           const x = (e.clientX - r.left) * (SIZE / r.width), y = (e.clientY - r.top) * (SIZE / r.height)
-          let best: { s: GaiaSource; cx: number; cy: number } | null = null, bd = 10
+          let best: Marker | null = null, bd = 10
           for (const m of markersRef.current) {
             const d = Math.hypot(m.cx - x, m.cy - y)
             if (d < bd) { bd = d; best = m }
           }
-          setHoverStar(best ? { s: best.s, x: best.cx, y: best.cy } : null)
+          setHoverStar(best)
         }}
         onMouseLeave={() => { onHover(null); setHoverStar(null) }}
       />
-      {hoverStar && <StarTooltip star={hoverStar.s} x={hoverStar.x} y={hoverStar.y} size={SIZE} />}
+      {hoverStar?.kind === 'gaia' && <StarTooltip star={hoverStar.s} x={hoverStar.cx} y={hoverStar.cy} size={SIZE} />}
+      {hoverStar?.kind === 'wise' && <WiseTooltip src={hoverStar.s} x={hoverStar.cx} y={hoverStar.cy} size={SIZE} />}
     </div>
   )
 }

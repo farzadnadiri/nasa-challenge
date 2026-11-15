@@ -147,7 +147,10 @@ def process_exposure(exp: Exposure, ra: float, dec: float, fov_deg: float,
     bad = (flags & _flag_bits(fhdr, config.BAD_FLAG_NAMES)) != 0
     data = img - d["zodi"] if d["zodi"] is not None else img.copy()
     img_r, var_r = clean_and_reproject(data, d["var"], bad, wcs, grid, n)
-    return {"image": img_r, "variance": var_r, "meta": meta}
+    # Pixels the pipeline flags as light from something else (ghost, streak, halo, crosstalk...).
+    cont = ((flags & _flag_bits(fhdr, config.CONTAMINATION_FLAG_NAMES)) != 0).astype(np.float32)
+    cont_r, _ = reproject_interp((cont, wcs), grid, shape_out=(n, n), order="nearest-neighbor")
+    return {"image": img_r, "variance": var_r, "contam": (np.nan_to_num(cont_r) > 0.5).astype(np.uint8), "meta": meta}
 
 
 def clean_and_reproject(data: np.ndarray, var: np.ndarray | None, bad: np.ndarray, wcs: WCS,

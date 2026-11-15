@@ -166,14 +166,23 @@ def _query_sia(ra: float, dec: float, detectors: list[int], collections: list[st
     out, errors = [], []
     for col in collections:
         params = [("COLLECTION", col), ("POS", f"circle {ra:.7f} {dec:.7f} 0.0003"), ("RESPONSEFORMAT", "votable")]
-        try:
-            r = httpx.get(config.IRSA_SIA, params=params, headers=config.IRSA_HEADERS,
-                          timeout=httpx.Timeout(connect=15, read=config.TAP_DEADLINE_S, write=15, pool=15))
-        except httpx.HTTPError as e:
-            errors.append(f"{col}: {type(e).__name__}")
-            continue
+        r, last = None, ""
+        for attempt in range(4):  # transient failures are retried with backoff
+            try:
+                r = httpx.get(config.IRSA_SIA, params=params, headers=config.IRSA_HEADERS,
+                              timeout=httpx.Timeout(connect=15, read=config.TAP_DEADLINE_S, write=15, pool=15))
+                if r.status_code < 500:
+                    break
+                last = f"HTTP {r.status_code}"
+            except httpx.HTTPError as e:
+                r, last = None, type(e).__name__
+            time.sleep(2 * (attempt + 1))
+        if r is None or r.status_code >= 500:
+            # Never accept a partial answer: missing one release would silently drop epochs and
+            # the incomplete result would be cached as if it were the whole sky history.
+            raise UpstreamError(f"IRSA SIA unavailable for {col} ({last}). Try again shortly.")
         if r.status_code != 200:
-            errors.append(f"{col}: HTTP {r.status_code}")
+            errors.append(f"{col}: HTTP {r.status_code}")  # e.g. a collection this release does not have
             continue
         t = Table.read(io.BytesIO(r.content), format="votable", use_names_over_ids=True)
         for row in t:

@@ -47,6 +47,8 @@ class Job:
     pixel_scale: float = config.PIXEL_SCALE_ARCSEC
     units: str = "MJy/sr"
     info: dict = field(default_factory=dict)  # dataset summary: files used / rejected
+    movers: dict | None = None   # moving-source search result, computed once the job is done
+    contams: list = field(default_factory=list)  # per-exposure contamination masks (uint8), aligned with images
     refresh_wait: float = 0.0    # seconds until this view may be refreshed again (last refresh request)
 
     def snapshot(self):
@@ -151,6 +153,7 @@ def _run_dataset(job: Job):
             })
             job.images.append(img)
             job.variances.append(var)
+            job.contams.append(None)  # uploads carry no contamination flags
     job.epochs = epochs
     job.total = len(epochs)
     # Units from the files actually used (a skipped file must not hide a common BUNIT).
@@ -220,6 +223,7 @@ def _run(job: Job):
                         job.metas.append(r["meta"])
                         job.images.append(r["image"])
                         job.variances.append(r["variance"])
+                        job.contams.append(r.get("contam"))
             job.status = "done"
             _save_cached(job)
         except (UpstreamError, uploads.UploadError) as e:
@@ -257,6 +261,25 @@ def _coadd(images: list[np.ndarray], variances: list[np.ndarray], idx: list[int]
         return np.where(wsum > 0, (np.nan_to_num(im) * w).sum(axis=0) / wsum, np.nan).astype(np.float32)
 
 
+def _contam_map(job: Job, idx: list[int]) -> np.ndarray | None:
+    """Fraction of the frame's exposures flagged as contaminated at each pixel, scaled 0-255."""
+    with job.lock:
+        masks = [job.contams[i] for i in idx if i < len(job.contams) and job.contams[i] is not None]
+    if not masks:
+        return None
+    return np.round(np.mean(np.stack(masks), axis=0) * 255).astype(np.uint8)
+
+
+def _flag_counts(metas: list[dict], idx: list[int]) -> dict:
+    """{flag name: number of exposures with that contamination flag at the target}."""
+    counts: dict[str, int] = {}
+    for i in idx:
+        for f in metas[i].get("target_flags", []):
+            if f in config.CONTAMINATION_FLAG_NAMES:
+                counts[f] = counts.get(f, 0) + 1
+    return counts
+
+
 def epoch_frames(job: Job, wl_min=None, wl_max=None) -> list[dict]:
     """Inverse-variance weighted mean image per epoch."""
     metas, images, variances = job.snapshot()
@@ -277,6 +300,8 @@ def epoch_frames(job: Job, wl_min=None, wl_max=None) -> list[dict]:
             "wavelength_max_um": max(wls) if wls else None,
             "n_contaminated": sum(1 for i in idx if _contaminated(metas[i])),
             "n_saturated": sum(1 for i in idx if _saturated(metas[i])),
+            "flag_counts": _flag_counts(metas, idx),
+            "contam": _contam_map(job, idx),
             "exposures": [metas[i]["obsid"] + f"D{metas[i]['detector']}" for i in idx],
         })
     # Epochs with few exposures are noisy and patchy; the UI skips them by default.
@@ -307,7 +332,7 @@ def wavelength_frames(job: Job) -> list[dict]:
             frames.append({"detector": 0, "channel": len(frames) + 1, "wavelength_um": wl or None, "filter": filt,
                            "wavelength_min_um": wl or None, "wavelength_max_um": wl or None, "n_used": len(idx),
                            "n_epochs": len({metas[i]["epoch"] for i in idx}), "n_contaminated": 0,
-                           "image": _coadd(images, variances, idx)})
+                           "image": _coadd(images, variances, idx), "contam": None, "flag_counts": {}})
         return frames
     for det in job.detectors:
         lo, hi = config.DETECTOR_RANGES[det]
@@ -324,6 +349,7 @@ def wavelength_frames(job: Job) -> list[dict]:
                 "n_epochs": len({metas[i]["epoch"] for i in idx}),
                 "n_contaminated": sum(1 for i in idx if _contaminated(metas[i])),
                 "image": _coadd(images, variances, idx) if idx else None,
+                "flag_counts": _flag_counts(metas, idx), "contam": _contam_map(job, idx) if idx else None,
             })
     return frames
 
@@ -339,7 +365,7 @@ def exposure_frames(job: Job, wl_min=None, wl_max=None) -> list[dict]:
     metas, images, _ = job.snapshot()
     order = sorted((i for i, m in enumerate(metas) if _in_range(m, wl_min, wl_max)), key=lambda i: metas[i]["mjd"])
     return [{"meta": {**metas[i], "contaminated": _contaminated(metas[i]), "saturated": _saturated(metas[i])},
-             "image": images[i]} for i in order]
+             "image": images[i], "contam": _contam_map(job, [i])} for i in order]
 
 
 def photometry(job: Job, x: float, y: float, r_ap: float = 2.0, r_in: float = 4.0, r_out: float = 7.0) -> list[dict]:
@@ -401,7 +427,9 @@ def _save_cached(job: Job):
     jp, npzp = _paths(job.key)
     np.savez_compressed(npzp,
                         images=np.stack(job.images) if job.images else np.zeros((0, 0, 0), np.float32),
-                        variances=np.stack(job.variances) if job.variances else np.zeros((0, 0, 0), np.float32))
+                        variances=np.stack(job.variances) if job.variances else np.zeros((0, 0, 0), np.float32),
+                        contams=np.stack([c if c is not None else np.zeros_like(job.images[0], np.uint8) for c in job.contams])
+                        if job.contams and job.images else np.zeros((0, 0, 0), np.uint8))
     jp.write_text(json.dumps({
         "ra": job.ra, "dec": job.dec, "fov": job.fov, "detectors": job.detectors, "collections": job.collections, "n": job.n,
         "total": job.total, "failed": job.failed, "epochs": job.epochs, "metas": job.metas,
@@ -423,5 +451,6 @@ def _load_cached(key: str) -> Job | None:
     job.dataset, job.units, job.info = d.get("dataset"), d.get("units", "MJy/sr"), d.get("info", {})
     job.pixel_scale = d.get("pixel_scale", config.PIXEL_SCALE_ARCSEC)
     job.images = list(arr["images"])
+    job.contams = list(arr["contams"]) if "contams" in arr.files else [None] * len(job.images)
     job.variances = list(arr["variances"])
     return job

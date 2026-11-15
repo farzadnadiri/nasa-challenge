@@ -184,3 +184,51 @@ def test_backend_generation_matches_worker_config():
     wrangler = (pathlib.Path(__file__).resolve().parents[2] / "worker" / "wrangler.jsonc").read_text(encoding="utf-8")
     gen = re.search(r'"CONTAINER_GEN":\s*"(\d+)"', wrangler).group(1)
     assert config.BACKEND_GEN == gen, "bump BACKEND_GEN in backend/app/config.py together with CONTAINER_GEN"
+
+
+def _synthetic_mover_job(n=81, scale=6.15, years=(2025.3, 2025.8, 2026.3, 2026.8, 2027.3), v_px_yr=1.0):
+    import numpy as np
+    from app import jobs
+    from app.cutouts import make_grid
+    fov = n * scale / 3600
+    job = jobs.Job("mv", 10.0, 20.0, fov, [6], ["spherex_dr1"], status="done", pixel_scale=scale)
+    rng = np.random.default_rng(5)
+    stars = [(rng.uniform(8, n - 8), rng.uniform(8, n - 8), rng.uniform(80, 400)) for _ in range(15)]
+    yy, xx = np.mgrid[0:n, 0:n]
+    for i, yr in enumerate(years):
+        img = rng.normal(0, 1, (n, n))
+        for x, y, f in stars:
+            img += f * np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * 0.8 ** 2))
+        mx = 30 + v_px_yr * (yr - years[0])
+        img += 300 * np.exp(-((xx - mx) ** 2 + (yy - 50) ** 2) / (2 * 0.8 ** 2))
+        job.images.append(img.astype(np.float32))
+        job.variances.append(np.ones((n, n), np.float32))
+        job.metas.append({"epoch": i, "psf_fwhm_arcsec": 1.9 * scale})
+        job.epochs.append({"index": i, "decimal_year": yr})
+    frames = [{"epoch": e, "n_used": 1, "shallow": False} for e in job.epochs]
+    grid, _ = make_grid(job.ra, job.dec, job.fov, scale)
+    return job, frames, grid
+
+
+def test_moving_source_without_gaia_is_a_candidate(monkeypatch):
+    from app import movers
+    job, frames, grid = _synthetic_mover_job()
+    monkeypatch.setattr(movers.gaia, "cone", lambda *a, **k: {"sources": []})
+    res = movers.find_movers(job, frames)
+    assert len(res["movers"]) == 1, res["movers"]          # the still stars are not flagged
+    m = res["movers"][0]
+    assert m["status"] == "candidate" and m["n_epochs"] == 5
+    assert abs(m["pm_arcsec_yr"] - 6.15) < 0.6             # 1 px/yr at 6.15"/px
+    assert m["pmra_mas_yr"] < 0                            # +x on the grid is west
+
+
+def test_moving_source_matching_gaia_is_known(monkeypatch):
+    from app import movers
+    job, frames, grid = _synthetic_mover_job()
+    # A Gaia star that sits on the track and moves the same way (pm in mas/yr, position at 2016.0).
+    ra0, dec0 = grid.wcs_pix2world([[30 + 1.0 * (2016.0 - 2025.3), 50]], 0)[0]
+    star = {"source_id": "1", "ra": float(ra0), "dec": float(dec0), "pmra": -6150.0, "pmdec": 0.0,
+            "phot_g_mean_mag": 12.0, "name": "Test star"}
+    monkeypatch.setattr(movers.gaia, "cone", lambda *a, **k: {"sources": [star]})
+    m = movers.find_movers(job, frames)["movers"][0]
+    assert m["status"] == "known" and m["gaia"]["name"] == "Test star"
