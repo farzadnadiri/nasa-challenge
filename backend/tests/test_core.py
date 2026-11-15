@@ -186,21 +186,26 @@ def test_backend_generation_matches_worker_config():
     assert config.BACKEND_GEN == gen, "bump BACKEND_GEN in backend/app/config.py together with CONTAINER_GEN"
 
 
-def _synthetic_mover_job(n=81, scale=6.15, years=(2025.3, 2025.8, 2026.3, 2026.8, 2027.3), v_px_yr=1.0):
+def _synthetic_mover_job(n=81, scale=6.15, years=(2025.3, 2025.8, 2026.3, 2026.8, 2027.3), v_px_yr=1.0,
+                         mover_flux=300.0, skip_mover=(), extra_stars=None, n_stars=15):
     import numpy as np
     from app import jobs
     from app.cutouts import make_grid
     fov = n * scale / 3600
     job = jobs.Job("mv", 10.0, 20.0, fov, [6], ["spherex_dr1"], status="done", pixel_scale=scale)
     rng = np.random.default_rng(5)
-    stars = [(rng.uniform(8, n - 8), rng.uniform(8, n - 8), rng.uniform(80, 400)) for _ in range(15)]
+    stars = [(rng.uniform(8, n - 8), rng.uniform(8, n - 8), rng.uniform(80, 400)) for _ in range(n_stars)]
     yy, xx = np.mgrid[0:n, 0:n]
     for i, yr in enumerate(years):
         img = rng.normal(0, 1, (n, n))
         for x, y, f in stars:
             img += f * np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * 0.8 ** 2))
+        if extra_stars and i in extra_stars:  # sources seen in this epoch only
+            for x, y, f in extra_stars[i]:
+                img += f * np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * 0.8 ** 2))
         mx = 30 + v_px_yr * (yr - years[0])
-        img += 300 * np.exp(-((xx - mx) ** 2 + (yy - 50) ** 2) / (2 * 0.8 ** 2))
+        if i not in skip_mover:
+            img += mover_flux * np.exp(-((xx - mx) ** 2 + (yy - 50) ** 2) / (2 * 0.8 ** 2))
         job.images.append(img.astype(np.float32))
         job.variances.append(np.ones((n, n), np.float32))
         job.metas.append({"epoch": i, "psf_fwhm_arcsec": 1.9 * scale})
@@ -210,10 +215,13 @@ def _synthetic_mover_job(n=81, scale=6.15, years=(2025.3, 2025.8, 2026.3, 2026.8
     return job, frames, grid
 
 
+FAR_STAR = {"source_id": "9", "ra": 10.0, "dec": 21.0, "pmra": 0.0, "pmdec": 0.0, "phot_g_mean_mag": 9.0}
+
+
 def test_moving_source_without_gaia_is_a_candidate(monkeypatch):
     from app import movers
     job, frames, grid = _synthetic_mover_job()
-    monkeypatch.setattr(movers.gaia, "cone", lambda *a, **k: {"sources": []})
+    monkeypatch.setattr(movers.gaia, "cone", lambda *a, **k: {"sources": [FAR_STAR]})
     res = movers.find_movers(job, frames)
     assert len(res["movers"]) == 1, res["movers"]          # the still stars are not flagged
     m = res["movers"][0]
@@ -232,3 +240,123 @@ def test_moving_source_matching_gaia_is_known(monkeypatch):
     monkeypatch.setattr(movers.gaia, "cone", lambda *a, **k: {"sources": [star]})
     m = movers.find_movers(job, frames)["movers"][0]
     assert m["status"] == "known" and m["gaia"]["name"] == "Test star"
+
+
+def test_mover_missing_from_the_richest_epoch_is_found(monkeypatch):
+    # Epoch 2 has the most detections (extra one-off sources) but not the mover: tracks must
+    # still start from other epochs.
+    from app import movers
+    extra = {2: [(12.0 + 9 * k, 70.0, 250.0) for k in range(6)]}
+    job, frames, grid = _synthetic_mover_job(skip_mover=(2,), extra_stars=extra)
+    monkeypatch.setattr(movers.gaia, "cone", lambda *a, **k: {"sources": [FAR_STAR]})
+    res = movers.find_movers(job, frames)
+    assert len(res["movers"]) == 1, res["movers"]
+    m = res["movers"][0]
+    assert m["status"] == "candidate" and m["n_epochs"] == 4
+    assert abs(m["pm_arcsec_yr"] - 6.15) < 0.6
+
+
+def test_star_cut_by_the_coverage_edge_is_not_measured():
+    import numpy as np
+    from app import movers
+    n = 61
+    yy, xx = np.mgrid[0:n, 0:n]
+    img = np.random.default_rng(1).normal(0, 1, (n, n)) + 400 * np.exp(-((xx - 30) ** 2 + (yy - 30) ** 2) / (2 * 0.8 ** 2))
+    img[:, 31:] = np.nan  # this epoch did not cover the right side, through the star
+    d = movers.detect(img, np.ones((n, n)), 2.5)
+    assert not np.any(np.hypot(d["x"] - 30, d["y"] - 30) < 3), list(zip(d["x"], d["y"]))
+    assert movers.measure_at(d, 30.0, 30.0) is None
+    # a small masked core inside the field is a saturated star, still measured and flagged
+    img2 = np.random.default_rng(2).normal(0, 1, (n, n)) + 400 * np.exp(-((xx - 30) ** 2 + (yy - 30) ** 2) / (2 * 1.2 ** 2))
+    img2[29:32, 29:32] = np.nan
+    d2 = movers.detect(img2, np.ones((n, n)), 2.5)
+    k = np.argmin(np.hypot(d2["x"] - 30, d2["y"] - 30))
+    assert abs(d2["x"][k] - 30) < 0.3 and abs(d2["y"][k] - 30) < 0.3 and d2["sat"][k]
+
+
+def test_motion_on_a_still_gaia_star_is_doubtful_not_a_candidate(monkeypatch):
+    from app import movers
+    # slow motion (0.3 px/yr, 2 yr) that never leaves a Gaia star with no proper motion
+    job, frames, grid = _synthetic_mover_job(v_px_yr=0.3)
+    ra0, dec0 = grid.wcs_pix2world([[30 + 0.3, 50]], 0)[0]
+    star = {"source_id": "7", "ra": float(ra0), "dec": float(dec0), "pmra": 0.0, "pmdec": 0.0,
+            "phot_g_mean_mag": 14.0, "name": "Still star"}
+    monkeypatch.setattr(movers.gaia, "cone", lambda *a, **k: {"sources": [star]})
+    ms = movers.find_movers(job, frames)["movers"]
+    assert len(ms) == 1 and ms[0]["status"] == "doubtful" and ms[0]["reason"] == "gaia_motion" and ms[0]["gaia"]["name"] == "Still star"
+
+
+def test_gaia_unavailable_marks_movers_unchecked(monkeypatch):
+    from app import movers
+
+    def down(*a, **k):
+        raise movers.UpstreamError("down")
+    job, frames, grid = _synthetic_mover_job()
+    monkeypatch.setattr(movers.gaia, "cone", down)
+    res = movers.find_movers(job, frames)
+    assert not res["gaia_checked"] and [m["status"] for m in res["movers"]] == ["unchecked"]
+
+
+def test_no_detection_is_shared_between_tracks():
+    import numpy as np
+    from app import movers
+    # two still stars 2 px apart and one epoch where only one of them is seen
+    def det(xs):
+        xs = np.array(xs, float)
+        return {"x": xs, "y": np.full(len(xs), 20.0), "err": np.full(len(xs), 0.1), "stat": np.full(len(xs), 0.05),
+                "flux": np.full(len(xs), 100.0), "snr": np.full(len(xs), 50.0), "sat": np.zeros(len(xs), bool)}
+    dets = [det([20, 22]), det([20, 22]), det([21]), det([20, 22])]
+    tracks = movers.link(dets, [2025.0, 2025.5, 2026.0, 2026.5], 6.15)
+    seen = [(e, j) for t in tracks for e, j in t.items()]
+    assert len(seen) == len(set(seen)) and len(tracks) == 2
+
+
+def test_very_bright_mover_with_small_systematics_is_kept(monkeypatch):
+    # A bright star whose centroid wobbles by ~0.1 px (parallax, saturation) must not fail the
+    # straight-line test just because the field's calibrated floor is tiny.
+    import numpy as np
+    from app import movers
+    job, frames, grid = _synthetic_mover_job(mover_flux=20000.0, years=(2025.3, 2025.8, 2026.3))
+    shifts = [0.1, -0.1, 0.1]
+    for i, sh in enumerate(shifts):
+        n = job.images[i].shape[0]
+        yy, xx = np.mgrid[0:n, 0:n]
+        mx = 30 + 1.0 * (job.epochs[i]["decimal_year"] - 2025.3)
+        job.images[i] -= (20000 * np.exp(-((xx - mx) ** 2 + (yy - 50) ** 2) / (2 * 0.8 ** 2))).astype(np.float32)
+        job.images[i] += (20000 * np.exp(-((xx - mx) ** 2 + (yy - 50 - sh) ** 2) / (2 * 0.8 ** 2))).astype(np.float32)
+    monkeypatch.setattr(movers.gaia, "cone", lambda *a, **k: {"sources": [FAR_STAR]})
+    ms = movers.find_movers(job, frames)["movers"]
+    assert len(ms) == 1 and abs(ms[0]["pm_arcsec_yr"] - 6.15) < 0.6, ms
+
+
+def test_empty_gaia_answer_counts_as_unchecked(monkeypatch):
+    from app import movers
+    job, frames, grid = _synthetic_mover_job()
+    monkeypatch.setattr(movers.gaia, "cone", lambda *a, **k: {"sources": []})
+    res = movers.find_movers(job, frames)
+    assert not res["gaia_checked"] and [m["status"] for m in res["movers"]] == ["unchecked"]
+
+
+def test_motion_resting_on_one_point_is_rejected(monkeypatch):
+    # A still source whose first epoch is 1 px off (a bad centroid) must not become a mover.
+    import numpy as np
+    from app import movers
+    job, frames, grid = _synthetic_mover_job(v_px_yr=0.0)
+    n = job.images[0].shape[0]
+    yy, xx = np.mgrid[0:n, 0:n]
+    job.images[0] -= (300 * np.exp(-((xx - 30) ** 2 + (yy - 50) ** 2) / (2 * 0.8 ** 2))).astype(np.float32)
+    job.images[0] += (300 * np.exp(-((xx - 31) ** 2 + (yy - 50.6) ** 2) / (2 * 0.8 ** 2))).astype(np.float32)
+    monkeypatch.setattr(movers.gaia, "cone", lambda *a, **k: {"sources": [FAR_STAR]})
+    assert movers.find_movers(job, frames)["movers"] == []
+
+
+def test_saturated_mover_without_gaia_is_doubtful(monkeypatch):
+    import numpy as np
+    from app import movers
+    job, frames, grid = _synthetic_mover_job()
+    for i, ep in enumerate(job.epochs):  # mask the mover's core in every epoch, as saturation does
+        mx = int(round(30 + 1.0 * (ep["decimal_year"] - 2025.3)))
+        job.images[i][50, mx] = np.nan
+    monkeypatch.setattr(movers.gaia, "cone", lambda *a, **k: {"sources": [FAR_STAR]})
+    ms = movers.find_movers(job, frames)["movers"]
+    assert len(ms) == 1 and ms[0]["status"] == "doubtful" and ms[0]["reason"] == "saturated"

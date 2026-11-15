@@ -86,9 +86,13 @@ export default function App() {
   const [addSet, setAddSet] = useState<number[] | null>(null)  // indices into the shown frames; null = all
   const [plusSet, setPlusSet] = useState<number[] | null>(null)  // null = last frame
   const [minusSet, setMinusSet] = useState<number[] | null>(null) // null = first frame
-  const [showWise, setShowWise] = useState(true)
+  const [showWise, setShowWise] = useState(false)  // overlays load only when ticked
   const [catwise, setCatwise] = useState<CatwiseSource[] | null>(null)
   const [showContam, setShowContam] = useState(false)
+  const [showTarget, setShowTarget] = useState(true)
+  const [showPick, setShowPick] = useState(true)
+  const [showFirstMark, setShowFirstMark] = useState(true)
+  const [showCompass, setShowCompass] = useState(true)
   const [result, setResult] = useState<FramesResult | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -98,13 +102,13 @@ export default function App() {
   const [speed, setSpeed] = useState(init.speed)
   const [stretch, setStretch] = useState<StretchOpts>({ display: 'frames', transfer: 'asinh', lowPct: 1, highPct: 99.5, invert: true })
   const [smooth, setSmooth] = useState(false)
-  const [showGaia, setShowGaia] = useState(true)
+  const [showGaia, setShowGaia] = useState(false)
   const [skipShallow, setSkipShallow] = useState(true)
   const [photMode, setPhotMode] = useState<'aperture' | 'wing'>('aperture')
   const [photUnit, setPhotUnit] = useState('mJy')
   const [showUpload, setShowUpload] = useState(false)
   // Moving-source search (our discovery feature): on by default, runs once the frames are ready.
-  const [findMovers, setFindMovers] = useState(true)
+  const [findMovers, setFindMovers] = useState(false)
   const [moversRes, setMoversRes] = useState<MoversResult | null>(null)
   const [moversLoading, setMoversLoading] = useState(false)
   // The archive view to return to after looking at an uploaded dataset.
@@ -144,7 +148,8 @@ export default function App() {
   }, [fov, dets, mode, release, deep])
 
   useEffect(() => {
-    if (!init.params && init.q) go(init.q)
+    // No target in the link: open on Barnard's Star, the classic fast mover.
+    if (!init.params) go(init.q || TARGETS[0].q, init.q ? undefined : TARGETS[0].fov)
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Settings changes re-run the view without re-resolving.
@@ -406,13 +411,16 @@ export default function App() {
               <Viewer grid={grid} frames={viewFrames} index={index} stretch={viewStretch} smooth={smooth}
                 gaia={showGaia ? gaia : null} gaiaEpoch={2016.0} movers={findMovers ? moversRes?.movers : null}
                 catwise={showWise ? catwise : null} catwiseEpoch={2015.4} showContam={showContam}
+                showTarget={showTarget} showPick={showPick} showFirstMark={showFirstMark} showCompass={showCompass}
                 pick={pick} onPick={onPick} onHover={setHover} />
               {/* What the markers on the image mean; entries appear only when that marker is shown. */}
               <div className="viewer-legend" aria-label="Image markers">
-                <span className="vl-item">
-                  <svg width="18" height="18" aria-hidden="true"><path d="M9 1V5M9 13V17M1 9H5M13 9H17" stroke="#ffc400" strokeWidth="2" /></svg>
-                  Target
-                </span>
+                {showTarget && (
+                  <span className="vl-item">
+                    <svg width="18" height="18" aria-hidden="true"><path d="M9 1V5M9 13V17M1 9H5M13 9H17" stroke="#ffc400" strokeWidth="2" /></svg>
+                    Target
+                  </span>
+                )}
                 {showGaia && gaia && (
                   <>
                     <span className="vl-item">
@@ -447,9 +455,15 @@ export default function App() {
                       <svg width="18" height="18" aria-hidden="true"><path d="M9 3 15 9 9 15 3 9Z" fill="none" stroke="rgb(255,79,216)" strokeWidth="1.6" strokeDasharray="3 3" /></svg>
                       Moving source matched to Gaia
                     </span>
+                    {moversRes?.movers.some((m) => m.status === 'doubtful') && (
+                      <span className="vl-item">
+                        <svg width="18" height="18" aria-hidden="true"><path d="M9 3 15 9 9 15 3 9Z" fill="none" stroke="rgba(255,79,216,0.6)" strokeWidth="1.2" strokeDasharray="1 3" /></svg>
+                        Doubtful motion (saturated, or a Gaia star on the track moves differently)
+                      </span>
+                    )}
                   </>
                 )}
-                {pick && (
+                {pick && showPick && (
                   <span className="vl-item">
                     <svg width="18" height="18" aria-hidden="true"><circle cx="9" cy="9" r="7" fill="none" stroke="rgb(0,255,140)" strokeWidth="1.8" /></svg>
                     Source you clicked (photometry aperture)
@@ -518,6 +532,35 @@ export default function App() {
               )}
             </div>
           )}
+          {findMovers && params && result?.status === 'done' && mode === 'epoch' && (
+            <MoversPanel result={moversRes} loading={moversLoading} onSelect={(m: Mover) => {
+              if (!geom) return
+              const f = frames[index]
+              const dt = (f?.decimalYear ?? m.year_mid) - m.year_mid
+              const ra = m.ra + (m.pmra_mas_yr * dt) / 3.6e6 / Math.max(Math.cos((m.dec * Math.PI) / 180), 1e-6)
+              const dec = m.dec + (m.pmdec_mas_yr * dt) / 3.6e6
+              const p = skyToPixel(geom, ra, dec)
+              if (p) onPick(p[0], p[1])
+            }} />
+          )}
+
+          {pick && (
+            <section className="photometry">
+              <h2>Source at {geom ? (() => { const s = pixelToSky(geom, pick[0], pick[1]); return `${formatRA(s[0])} ${formatDec(s[1])}` })() : ''}</h2>
+              {phot ? <PhotometryCharts points={phot} mode={photMode} unit={photUnit}
+                hiddenEpochs={skipShallow && mode === 'epoch' ? (result?.frames ?? []).flatMap((f, i) => (f.shallow ? [i] : [])) : []}
+                epochDates={result?.epochs.map((e) => e.date_mid) ?? []} /> : <p className="muted">Measuring…</p>}
+            </section>
+          )}
+
+          {params && result && result.frames.length > 0 && (
+            <ExposureTable params={params} ready={result.status === 'done'}
+              currentKey={mode === 'exposure' && frame?.meta ? `${frame.meta.obsid}D${frame.meta.detector}` : undefined} />
+          )}
+
+          {result?.status === 'done' && result.frames.length === 0 && (
+            <p className="muted">No SPHEREx images cover this position yet in the selected detectors.</p>
+          )}
         </section>
 
         <aside className="controls">
@@ -549,6 +592,36 @@ export default function App() {
               <div className="muted small">{resolved.note}</div>
             </div>
           )}
+
+          <fieldset>
+            <legend>Playback</legend>
+            <div className="row">
+              <button onClick={() => setPlaying((p) => !p)}>{playing ? 'Pause' : 'Play'}</button>
+              <button onClick={() => { setPlaying(false); setIndex((i) => (i - 1 + nFrames) % Math.max(1, nFrames)) }} aria-label="Previous frame">◀</button>
+              <button onClick={() => { setPlaying(false); setIndex((i) => (i + 1) % Math.max(1, nFrames)) }} aria-label="Next frame">▶</button>
+            </div>
+            <button className="download-btn export-btn" disabled={!grid?.n || !frame} onClick={async () => {
+              setPlaying(false)
+              const name = params?.dataset ? 'Uploaded dataset' : resolved?.name ?? 'Sky position'
+              const where = grid?.n ? `${formatRA(grid.ra)} ${formatDec(grid.dec)}` : ''
+              try {
+                await exportSideBySide({
+                  title: `${name} · ${where} · field ${(grid!.n * grid!.pixel_scale_arcsec / 60).toFixed(1)}′`,
+                  left: `SPHEREx ${frame!.label} · ${frame!.date}${frame!.wavelength ? ` · ${frame!.wavelength[0].toFixed(2)}–${frame!.wavelength[1].toFixed(2)} µm` : ''}`,
+                  right: `Reference: ${REF_SOURCES.find((r) => r.id === refSource)?.label ?? refSource}`,
+                  detail: 'SPHEREx Sky Motion Explorer by Team Barobax · spherex.peykan.ai · Data: NASA/IPAC IRSA, ESA Gaia DR3',
+                }, `spherex_${name.replace(/[^A-Za-z0-9]+/g, '_')}_${frame!.label.replace(/[^A-Za-z0-9]+/g, '_')}.png`)
+              } catch (e) {
+                setError(`Export failed: ${(e as Error).message}`)
+              }
+            }}>
+              <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1v9M4 6.5 8 10.5 12 6.5M2 13.5h12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /></svg>
+              Export image (both panels)
+            </button>
+            <label>Blink interval {speed} ms
+              <input type="range" min={100} max={2000} step={50} value={speed} onChange={(e) => setSpeed(+e.target.value)} />
+            </label>
+          </fieldset>
 
           <fieldset>
             <legend>View</legend>
@@ -631,33 +704,22 @@ export default function App() {
           </fieldset>
 
           <fieldset>
-            <legend>Playback</legend>
-            <div className="row">
-              <button onClick={() => setPlaying((p) => !p)}>{playing ? 'Pause' : 'Play'}</button>
-              <button onClick={() => { setPlaying(false); setIndex((i) => (i - 1 + nFrames) % Math.max(1, nFrames)) }} aria-label="Previous frame">◀</button>
-              <button onClick={() => { setPlaying(false); setIndex((i) => (i + 1) % Math.max(1, nFrames)) }} aria-label="Next frame">▶</button>
-            </div>
-            <button className="download-btn export-btn" disabled={!grid?.n || !frame} onClick={async () => {
-              setPlaying(false)
-              const name = params?.dataset ? 'Uploaded dataset' : resolved?.name ?? 'Sky position'
-              const where = grid?.n ? `${formatRA(grid.ra)} ${formatDec(grid.dec)}` : ''
-              try {
-                await exportSideBySide({
-                  title: `${name} · ${where} · field ${(grid!.n * grid!.pixel_scale_arcsec / 60).toFixed(1)}′`,
-                  left: `SPHEREx ${frame!.label} · ${frame!.date}${frame!.wavelength ? ` · ${frame!.wavelength[0].toFixed(2)}–${frame!.wavelength[1].toFixed(2)} µm` : ''}`,
-                  right: `Reference: ${REF_SOURCES.find((r) => r.id === refSource)?.label ?? refSource}`,
-                  detail: 'SPHEREx Sky Motion Explorer by Team Barobax · spherex.peykan.ai · Data: NASA/IPAC IRSA, ESA Gaia DR3',
-                }, `spherex_${name.replace(/[^A-Za-z0-9]+/g, '_')}_${frame!.label.replace(/[^A-Za-z0-9]+/g, '_')}.png`)
-              } catch (e) {
-                setError(`Export failed: ${(e as Error).message}`)
-              }
-            }}>
-              <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1v9M4 6.5 8 10.5 12 6.5M2 13.5h12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /></svg>
-              Export image (both panels)
-            </button>
-            <label>Blink interval {speed} ms
-              <input type="range" min={100} max={2000} step={50} value={speed} onChange={(e) => setSpeed(+e.target.value)} />
+            <legend>Field of view</legend>
+            <label>{(fovDraft * 60).toFixed(1)}′
+              <input type="range" min={0.02} max={0.25} step={0.01} value={fovDraft} onChange={(e) => setFovDraft(+e.target.value)} />
             </label>
+          </fieldset>
+
+          <fieldset>
+            <legend>Overlays</legend>
+            <label className="check"><input type="checkbox" checked={showTarget} onChange={(e) => setShowTarget(e.target.checked)} /> Target crosshair <small className="muted">(yellow)</small></label>
+            <label className="check"><input type="checkbox" checked={showGaia} onChange={(e) => setShowGaia(e.target.checked)} /> Gaia DR3 stars <small className="muted">(blue circles, fast in red)</small></label>
+            <label className="check"><input type="checkbox" checked={showWise} onChange={(e) => setShowWise(e.target.checked)} /> WISE sources <small className="muted">(CatWISE2020, orange squares)</small></label>
+            <label className="check"><input type="checkbox" checked={findMovers} onChange={(e) => setFindMovers(e.target.checked)} /> Moving sources <small className="muted">(magenta diamonds and tracks)</small></label>
+            <label className="check"><input type="checkbox" checked={showContam} onChange={(e) => setShowContam(e.target.checked)} /> Contamination map <small className="muted">(flagged pixels)</small></label>
+            <label className="check"><input type="checkbox" checked={showPick} onChange={(e) => setShowPick(e.target.checked)} /> Clicked source <small className="muted">(green circle)</small></label>
+            <label className="check"><input type="checkbox" checked={showFirstMark} onChange={(e) => setShowFirstMark(e.target.checked)} /> First-frame border <small className="muted">(dashed yellow)</small></label>
+            <label className="check"><input type="checkbox" checked={showCompass} onChange={(e) => setShowCompass(e.target.checked)} /> Compass and scale bar</label>
           </fieldset>
 
           {!params?.dataset && <fieldset>
@@ -724,13 +786,6 @@ export default function App() {
           </fieldset>
 
           <fieldset>
-            <legend>Field of view</legend>
-            <label>{(fovDraft * 60).toFixed(1)}′
-              <input type="range" min={0.02} max={0.25} step={0.01} value={fovDraft} onChange={(e) => setFovDraft(+e.target.value)} />
-            </label>
-          </fieldset>
-
-          <fieldset>
             <legend>Display</legend>
             <label>Brightness clip {stretch.highPct}%
               <input type="range" min={95} max={99.95} step={0.05} value={stretch.highPct} onChange={(e) => setStretch({ ...stretch, highPct: +e.target.value })} />
@@ -739,43 +794,9 @@ export default function App() {
             <label className="check"><input type="checkbox" checked={stretch.invert} onChange={(e) => setStretch({ ...stretch, invert: e.target.checked })} /> Invert (dark stars)</label>
             <label className="check"><input type="checkbox" checked={smooth} onChange={(e) => setSmooth(e.target.checked)} /> Smooth pixels</label>
             <label className="check"><input type="checkbox" checked={skipShallow} onChange={(e) => setSkipShallow(e.target.checked)} /> Skip shallow epochs <small className="muted">(few exposures)</small></label>
-            <label className="check"><input type="checkbox" checked={findMovers} onChange={(e) => setFindMovers(e.target.checked)} /> Find moving sources <small className="muted">(candidates in magenta)</small></label>
-            <label className="check"><input type="checkbox" checked={showWise} onChange={(e) => setShowWise(e.target.checked)} /> WISE overlay <small className="muted">(CatWISE2020, orange squares)</small></label>
-            <label className="check"><input type="checkbox" checked={showContam} onChange={(e) => setShowContam(e.target.checked)} /> Show contamination map <small className="muted">(flagged pixels)</small></label>
-            <label className="check"><input type="checkbox" checked={showGaia} onChange={(e) => setShowGaia(e.target.checked)} /> Gaia DR3 overlay <small className="muted">(moved to frame date)</small></label>
           </fieldset>
         </aside>
       </main>
-
-      {findMovers && params && result?.status === 'done' && mode === 'epoch' && (
-        <MoversPanel result={moversRes} loading={moversLoading} onSelect={(m: Mover) => {
-          if (!geom) return
-          const f = frames[index]
-          const dt = (f?.decimalYear ?? m.year_mid) - m.year_mid
-          const ra = m.ra + (m.pmra_mas_yr * dt) / 3.6e6 / Math.max(Math.cos((m.dec * Math.PI) / 180), 1e-6)
-          const dec = m.dec + (m.pmdec_mas_yr * dt) / 3.6e6
-          const p = skyToPixel(geom, ra, dec)
-          if (p) onPick(p[0], p[1])
-        }} />
-      )}
-
-      {pick && (
-        <section className="photometry">
-          <h2>Source at {geom ? (() => { const s = pixelToSky(geom, pick[0], pick[1]); return `${formatRA(s[0])} ${formatDec(s[1])}` })() : ''}</h2>
-          {phot ? <PhotometryCharts points={phot} mode={photMode} unit={photUnit}
-            hiddenEpochs={skipShallow && mode === 'epoch' ? (result?.frames ?? []).flatMap((f, i) => (f.shallow ? [i] : [])) : []}
-            epochDates={result?.epochs.map((e) => e.date_mid) ?? []} /> : <p className="muted">Measuring…</p>}
-        </section>
-      )}
-
-      {params && result && result.frames.length > 0 && (
-        <ExposureTable params={params} ready={result.status === 'done'}
-          currentKey={mode === 'exposure' && frame?.meta ? `${frame.meta.obsid}D${frame.meta.detector}` : undefined} />
-      )}
-
-      {result?.status === 'done' && result.frames.length === 0 && (
-        <p className="muted">No SPHEREx images cover this position yet in the selected detectors.</p>
-      )}
 
       <footer className="muted small">
         Data: NASA SPHEREx via NASA/IPAC Infrared Science Archive (IRSA); ESA Gaia DR3; CDS Sesame.

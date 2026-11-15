@@ -281,16 +281,21 @@ export interface ExposureRow extends ExposureMeta {
 }
 
 export interface Mover {
-  status: 'candidate' | 'known'
+  // candidate: no Gaia star; known: Gaia star moving the same way; unchecked: Gaia was unreachable;
+  // doubtful: motion probably an artifact (reason: a Gaia star on the track moves differently, or saturated)
+  status: 'candidate' | 'known' | 'doubtful' | 'unchecked'
+  reason?: 'gaia_motion' | 'saturated' | null
   ra: number
   dec: number
   year_mid: number
   pmra_mas_yr: number
   pmdec_mas_yr: number
   pm_arcsec_yr: number
+  pm_err_arcsec_yr?: number
   significance: number
   chi2_red: number
   n_epochs: number
+  n_forced?: number
   snr: number
   saturated: boolean
   gaia: { source_id: string; name: string | null; pm_arcsec_yr: number; g_mag: number | null } | null
@@ -303,6 +308,7 @@ export interface MoversResult {
   n_epochs: number
   n_tracks?: number
   gaia_checked?: boolean
+  gaia_truncated?: boolean
   note?: string
 }
 

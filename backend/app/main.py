@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import threading
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query
@@ -197,6 +198,9 @@ def catwise_cone(ra: float = Query(..., ge=0, le=360), dec: float = Query(..., g
         raise HTTPException(503, str(e))
 
 
+_mover_locks: dict[str, threading.Lock] = {}
+
+
 @app.get("/api/movers")
 def movers_endpoint(
     ra: float | None = Query(None, ge=0, le=360),
@@ -215,7 +219,13 @@ def movers_endpoint(
     if debug:
         return _cached_response({"status": "done", **find_movers(job, jobs.epoch_frames(job), debug=True)}, False)
     if job.movers is None:
-        job.movers = find_movers(job, jobs.epoch_frames(job))
+        with _mover_locks.setdefault(job.key, threading.Lock()):  # one search per job, others wait for it
+            if job.movers is None:
+                res = find_movers(job, jobs.epoch_frames(job))
+                if not res.get("gaia_checked"):
+                    # Gaia was unreachable: answer now, but search again next time instead of keeping it
+                    return _cached_response({"status": "done", **res}, False)
+                job.movers = res
     # Positions are sky coordinates, so the client places them in whatever field it shows.
     return _cached_response({"status": "done", **job.movers}, True)
 

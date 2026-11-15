@@ -14,7 +14,7 @@
   // IRSA_PROXY_KEY is a secret: `npx wrangler secret put IRSA_PROXY_KEY`.
   // Bump CONTAINER_GEN when the backend changes: requests then go to a fresh container running
   // the new image instead of the old instance, which only retires after 30 idle minutes.
-  "vars": { "PUBLIC_URL": "https://spherex.peykan.ai", "CONTAINER_GEN": "17" },
+  "vars": { "PUBLIC_URL": "https://spherex.peykan.ai", "CONTAINER_GEN": "20" },
   "secrets": { "required": ["IRSA_PROXY_KEY"] },
 
   // React build, served directly; /api/* goes through the Worker first.

@@ -31,7 +31,7 @@ PIPELINE_VERSION = "4"  # 4: contamination masks
 # its CONTAINER_GEN. An old image still running during a rollout reports its own, older number, so
 # its answers are never cached under the new generation. Bump together with CONTAINER_GEN in
 # worker/wrangler.jsonc (tests/test_core.py checks they match).
-BACKEND_GEN = "17"
+BACKEND_GEN = "20"
 
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", Path(__file__).resolve().parents[1] / ".cache"))
 CACHE_TTL_DAYS = float(os.environ.get("CACHE_TTL_DAYS", "7"))  # SPHEREx ingests weekly

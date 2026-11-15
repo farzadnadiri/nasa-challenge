@@ -63,6 +63,16 @@ motion. Barnard's Star has moved 4.5′ since 2000 and would otherwise be off-fr
 - Difference imaging (frame minus the mean of all frames) and **A − B** (any frame minus another:
   two epochs to see what moved, or two wavelength channels for a colour image)
 - Gaia DR3 overlay with each star moved to the frame's date (fast movers in red; brightest 80 shown)
+- **Moving-source search** (Display box, "Find moving sources"): sources are detected in every deep
+  epoch stack (only where that epoch has real coverage), linked across epochs (any epoch can start a
+  track; each detection is used once), completed with forced measurements, and fitted with a straight
+  line. Position errors are calibrated on the still stars of the field (a systematic floor and a
+  signal-to-noise term, fitted separately). Listed when the motion is at least 5σ and 0.3″/yr over 3+
+  epochs, seen in at least 60% of the epochs covering it with 3+ real detections, and still 3σ when
+  any one point is left out. Then compared with Gaia DR3 (down to 20,000 stars) by full motion vector:
+  **candidate** (no Gaia star on the track), **known** (a Gaia star moves the same way), **doubtful**
+  (saturated, or a Gaia star sits on the track but moves differently) or **unchecked** (Gaia unreachable;
+  not cached, so the next request checks again)
 - Reference panel beside the blink view: unWISE or Legacy Survey cutouts, a stack of all SPHEREx epochs,
   or **CDS Aladin Lite** (interactive; AllWISE, 2MASS and DSS imagery from IRSA's HiPS mirrors, Gaia DR3
   and CatWISE2020 overlays). `?ref=aladin` opens it directly. Aladin is loaded only when chosen.
@@ -152,6 +162,7 @@ python ../backend/prewarm.py https://spherex.peykan.ai   # fill the cache for th
 | `GET /api/exposures?ra&dec&fov&dets` | Metadata for every exposure (no pixels) |
 | `GET /api/photometry?ra&dec&fov&dets&x&y` | Aperture photometry at a grid pixel for every exposure |
 | `GET /api/gaia?ra&dec&radius` | Gaia DR3 sources (epoch 2016.0) |
+| `GET /api/movers?ra&dec&fov&dets&release&deep` | Moving sources with status, motion, significance and per-epoch positions; `debug=1` adds every track and the error model |
 
 ## Data credits
 

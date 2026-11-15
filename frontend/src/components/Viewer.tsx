@@ -15,6 +15,10 @@ interface Props {
   catwiseEpoch?: number
   showContam?: boolean
   movers?: Mover[] | null
+  showTarget?: boolean
+  showPick?: boolean
+  showFirstMark?: boolean
+  showCompass?: boolean
   pick: [number, number] | null
   onPick: (x: number, y: number) => void
   onHover: (xy: [number, number] | null) => void
@@ -71,7 +75,7 @@ function StarTooltip({ star, x, y, size }: { star: GaiaSource; x: number; y: num
   )
 }
 
-export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, catwise, catwiseEpoch = 2015.4, showContam, movers, pick, onPick, onHover }: Props) {
+export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, catwise, catwiseEpoch = 2015.4, showContam, movers, showTarget = true, showPick = true, showFirstMark = true, showCompass = true, pick, onPick, onHover }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
   // Gaia markers as drawn in the current frame (canvas CSS px), for hover lookups.
@@ -200,7 +204,8 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
     }
 
     // Moving sources: the measured track, and a diamond at this frame's date
-    // (magenta solid = new candidate with no Gaia match, dashed = matched to a Gaia star).
+    // (magenta solid = new candidate with no Gaia match or unchecked, dashed = matched to a Gaia star,
+    // faint dotted = a Gaia star on the track moves differently, so the motion is doubtful).
     if (movers && frame) {
       const dec0 = grid.dec * (Math.PI / 180)
       for (const m of movers) {
@@ -217,10 +222,12 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
         const p = skyToPixel(geom, ra, dec)
         if (!p) continue
         const [cx, cy] = toCanvas(p[0], p[1])
-        const r = m.status === 'candidate' ? 12 : 9
-        ctx.strokeStyle = 'rgba(255, 79, 216, 0.95)'
-        ctx.lineWidth = m.status === 'candidate' ? 2.2 : 1.6
-        ctx.setLineDash(m.status === 'candidate' ? [] : [3, 3])
+        const isNew = m.status === 'candidate' || m.status === 'unchecked'
+        const doubtful = m.status === 'doubtful'
+        const r = isNew ? 12 : 9
+        ctx.strokeStyle = doubtful ? 'rgba(255, 79, 216, 0.5)' : 'rgba(255, 79, 216, 0.95)'
+        ctx.lineWidth = isNew ? 2.2 : doubtful ? 1.2 : 1.6
+        ctx.setLineDash(isNew ? [] : doubtful ? [1, 3] : [3, 3])
         ctx.beginPath()
         ctx.moveTo(cx, cy - r); ctx.lineTo(cx + r, cy); ctx.lineTo(cx, cy + r); ctx.lineTo(cx - r, cy); ctx.closePath()
         ctx.stroke()
@@ -229,17 +236,19 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
     }
 
     // Target crosshair (gap in the middle so the source stays visible).
-    const c = toCanvas((grid.n - 1) / 2, (grid.n - 1) / 2)
-    ctx.strokeStyle = 'rgba(255, 196, 0, 0.9)'
-    ctx.lineWidth = 1.5
-    ctx.beginPath()
-    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-      ctx.moveTo(c[0] + dx * 10, c[1] + dy * 10)
-      ctx.lineTo(c[0] + dx * 22, c[1] + dy * 22)
+    if (showTarget) {
+      const c = toCanvas((grid.n - 1) / 2, (grid.n - 1) / 2)
+      ctx.strokeStyle = 'rgba(255, 196, 0, 0.9)'
+      ctx.lineWidth = 1.5
+      ctx.beginPath()
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        ctx.moveTo(c[0] + dx * 10, c[1] + dy * 10)
+        ctx.lineTo(c[0] + dx * 22, c[1] + dy * 22)
+      }
+      ctx.stroke()
     }
-    ctx.stroke()
 
-    if (pick) {
+    if (pick && showPick) {
       const [px, py] = toCanvas(pick[0], pick[1])
       ctx.strokeStyle = 'rgba(0, 255, 140, 0.95)'
       ctx.beginPath()
@@ -248,7 +257,7 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
     }
 
     // First frame of the loop gets a dashed border (as in WiseView) so a mover's direction is unambiguous.
-    if (index === 0 && frames.length > 1) {
+    if (showFirstMark && index === 0 && frames.length > 1) {
       ctx.setLineDash([8, 6])
       ctx.strokeStyle = 'rgba(255, 196, 0, 0.9)'
       ctx.lineWidth = 3
@@ -258,6 +267,7 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
 
     // Compass (N up, E left) and a 1' scale bar, drawn with a dark halo so they read on
     // both normal and inverted images.
+    if (!showCompass) return
     const arcminPx = (60 / grid.pixel_scale_arcsec) * k
     ctx.font = 'bold 12px system-ui, sans-serif'
     ctx.lineJoin = 'round'
@@ -277,7 +287,7 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
       ctx.fillStyle = 'rgba(255,255,255,0.95)'
       ctx.fillText(text, x, y)
     }
-  }, [bitmaps, contamBitmaps, showContam, index, smooth, gaia, gaiaEpoch, catwise, catwiseEpoch, movers, frames, geom, grid, pick, SIZE])
+  }, [bitmaps, contamBitmaps, showContam, index, smooth, gaia, gaiaEpoch, catwise, catwiseEpoch, movers, showTarget, showPick, showFirstMark, showCompass, frames, geom, grid, pick, SIZE])
 
   const toGrid = (e: React.MouseEvent<HTMLCanvasElement>): [number, number] => {
     const r = e.currentTarget.getBoundingClientRect()
