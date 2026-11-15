@@ -123,11 +123,11 @@ def test_refresh_restarts_a_finished_view_once_cooldown_passed(monkeypatch):
     monkeypatch.setitem(jobs._jobs, key, old)
 
     monkeypatch.setattr(config, "REFRESH_MIN_S", 3600.0)
-    assert jobs.get_or_start(1.0, 2.0, 0.15, [6], ["spherex_dr1"], refresh=True) is old  # too soon
+    assert jobs._get_or_start_part(1.0, 2.0, 0.15, [6], ["spherex_dr1"], refresh=True) is old  # too soon
     assert old.refresh_wait > 3500 and not started
 
     monkeypatch.setattr(config, "REFRESH_MIN_S", 0.0)
-    new = jobs.get_or_start(1.0, 2.0, 0.15, [6], ["spherex_dr1"], refresh=True)
+    new = jobs._get_or_start_part(1.0, 2.0, 0.15, [6], ["spherex_dr1"], refresh=True)
     assert new is not old and new.fresh and started == [new]                       # fresh archive search
 
 
@@ -438,3 +438,76 @@ def test_photometry_contamination_is_judged_at_the_clicked_spot():
         job.contams.append(mask)
     pts, _ = jobs.photometry(job, 4.0, 4.0)
     assert [p["contaminated"] for p in sorted(pts, key=lambda p: p["mjd"])] == [False, True]
+
+
+def _part(jobs, det, mjds, status="done"):
+    import numpy as np
+    key = jobs.job_key(1.0, 2.0, 0.15, [det], ["spherex_dr1"])
+    p = jobs.Job(key, 1.0, 2.0, 0.15, [det], ["spherex_dr1"], status=status, n=4, total=len(mjds))
+    for k, mjd in enumerate(mjds):
+        p.metas.append({"obsid": f"o{k}", "detector": det, "mjd": mjd + 0.001, "epoch": 0, "wavelength_um": 4.0 + det / 10})
+        p.images.append(np.full((4, 4), det, np.float32))
+        p.variances.append(np.ones((4, 4), np.float32))
+        p.contams.append(None)
+    p.planned = [{"obsid": f"o{k}", "detector": det, "mjd": mjd} for k, mjd in enumerate(mjds)]
+    return p
+
+
+def test_view_combines_detector_jobs_and_reuses_them(monkeypatch):
+    from app import jobs
+    started = []
+    monkeypatch.setattr(jobs, "_run", lambda job: started.append(job.detectors))
+    monkeypatch.setattr(jobs.threading, "Thread", lambda target, args, daemon: type("T", (), {"start": lambda self: target(*args)})())
+    monkeypatch.setattr(jobs, "_jobs", {})
+    monkeypatch.setattr(jobs, "_views", {})
+    for det, mjds in ((5, [60000.0, 60001.0, 60200.0]), (6, [60000.5, 60200.5, 60400.0])):
+        part = _part(jobs, det, mjds)
+        jobs._jobs[part.key] = part
+    v = jobs.get_or_start(1.0, 2.0, 0.15, [6, 5], ["spherex_dr1"])
+    assert v.status == "done" and len(v.images) == 6 and started == []        # nothing processed again
+    assert [e["n_exposures"] for e in v.epochs] == [3, 2, 1]                  # epochs over both detectors
+    assert sorted(m["epoch"] for m in v.metas) == [0, 0, 0, 1, 1, 2]
+    assert jobs.get_or_start(1.0, 2.0, 0.15, [5, 6], ["spherex_dr1"]) is v   # same view object: movers kept
+    one = jobs.get_or_start(1.0, 2.0, 0.15, [5], ["spherex_dr1"])           # removing a detector: no work
+    assert len(one.images) == 3 and started == []
+    jobs.get_or_start(1.0, 2.0, 0.15, [4, 5, 6], ["spherex_dr1"])           # adding one: only that one runs
+    assert started == [[4]]
+
+
+def test_view_is_loading_until_every_detector_is_done(monkeypatch):
+    from app import jobs
+    monkeypatch.setattr(jobs, "_jobs", {})
+    monkeypatch.setattr(jobs, "_views", {})
+    a, b = _part(jobs, 5, [60000.0]), _part(jobs, 6, [60000.2], status="fetching")
+    v = jobs._combine("k", 1.0, 2.0, 0.15, [5, 6], ["spherex_dr1"], [a, b])
+    assert v.status == "fetching" and v.total == 2 and len(v.epochs) == 1
+    b.status, b.error = "error", "boom"
+    assert jobs._combine("k", 1.0, 2.0, 0.15, [5, 6], ["spherex_dr1"], [a, b]).status == "error"
+
+
+def test_free_slot_goes_to_the_view_being_watched():
+    import threading
+    import time
+    from app import jobs
+    slots = jobs._Slots(1)
+    busy = jobs.Job("busy", 0, 0, 0.1, [1])
+    assert slots.acquire(busy)
+    old = jobs.Job("old", 0, 0, 0.1, [1], polled=time.time() - 30)   # queued earlier, nobody watching
+    new = jobs.Job("new", 0, 0, 0.1, [2])                           # the view on screen
+    order = []
+    for j in (old, new):
+        threading.Thread(target=lambda j=j: order.append(j.key if slots.acquire(j) else "gave up " + j.key),
+                         daemon=True).start()
+    time.sleep(0.2)
+    slots.release()
+    for _ in range(50):
+        if order:
+            break
+        time.sleep(0.05)
+    assert order[0] == "new"
+    old.polled = time.time() - 100     # nobody asked for it any more: it leaves the queue
+    for _ in range(80):
+        if len(order) == 2:
+            break
+        time.sleep(0.05)
+    assert order == ["new", "gave up old"]

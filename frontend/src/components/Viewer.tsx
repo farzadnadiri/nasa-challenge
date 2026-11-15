@@ -119,16 +119,24 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
     return c
   }), [frames, grid.n])
 
+  // Each frame is drawn on first use and kept: opening a 102-channel wavelength view costs one
+  // frame, not 102. The next frame is prepared right after, so blinking stays smooth.
   const bitmaps = useMemo(() => {
-    if (!grid.n) return []
+    const cache: (HTMLCanvasElement | undefined)[] = []
+    if (!grid.n) return { length: 0, get: (_i: number): HTMLCanvasElement | undefined => undefined }
     const shown = displayFrames(frames.map((f) => f.data), stretch.display)
     const lim = computeLimits(shown, stretch)
-    return shown.map((f) => {
-      const c = document.createElement('canvas')
-      c.width = c.height = grid.n
-      c.getContext('2d')!.putImageData(renderToImageData(f, grid.n, lim, stretch), 0, 0)
-      return c
-    })
+    const get = (i: number): HTMLCanvasElement | undefined => {
+      if (i < 0 || i >= shown.length) return undefined
+      if (!cache[i]) {
+        const c = document.createElement('canvas')
+        c.width = c.height = grid.n
+        c.getContext('2d')!.putImageData(renderToImageData(shown[i], grid.n, lim, stretch), 0, 0)
+        cache[i] = c
+      }
+      return cache[i]
+    }
+    return { length: shown.length, get }
   }, [frames, grid.n, stretch])
 
   useEffect(() => {
@@ -141,7 +149,8 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     ctx.clearRect(0, 0, SIZE, SIZE)
     const k = SIZE / grid.n // CSS px per grid pixel
-    const bmp = bitmaps[index]
+    const bmp = bitmaps.get(index)
+    if (bitmaps.length > 1) setTimeout(() => bitmaps.get((index + 1) % bitmaps.length), 0)
     if (bmp) {
       ctx.imageSmoothingEnabled = smooth
       ctx.drawImage(bmp, 0, 0, SIZE, SIZE)

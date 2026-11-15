@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 import time
 from dataclasses import dataclass, asdict
 
@@ -66,6 +67,9 @@ def _cache_path(ra: float, dec: float, detectors: list[int], collections: list[s
     return config.CACHE_DIR / f"query_{key}.json"
 
 
+_query_locks: dict[str, threading.Lock] = {}
+
+
 def query_exposures(ra: float, dec: float, detectors: list[int], collections: list[str] | None = None,
                     fresh: bool = False) -> list[Exposure]:
     """All spectral images whose footprint contains (ra, dec), oldest first.
@@ -76,11 +80,15 @@ def query_exposures(ra: float, dec: float, detectors: list[int], collections: li
     """
     collections = collections or current_collections()
     path = _cache_path(ra, dec, detectors, collections)
-    if not fresh and path.exists() and time.time() - path.stat().st_mtime < config.CACHE_TTL_DAYS * 86400:
-        return [Exposure(**{**d, "epoch": -1}) for d in json.loads(path.read_text())]
-    exps = _query_exposures_live(ra, dec, detectors, collections)
-    path.write_text(json.dumps([e.to_dict() for e in exps]))
-    return exps
+    with _query_locks.setdefault(str(path), threading.Lock()):  # detector jobs of one view search once
+        if path.exists():
+            age = time.time() - path.stat().st_mtime
+            # fresh: a sibling detector job may have searched again moments ago; reuse that
+            if age < (120 if fresh else config.CACHE_TTL_DAYS * 86400):
+                return [Exposure(**{**d, "epoch": -1}) for d in json.loads(path.read_text())]
+        exps = _query_exposures_live(ra, dec, detectors, collections)
+        path.write_text(json.dumps([e.to_dict() for e in exps]))
+        return exps
 
 
 def _query_exposures_live(ra: float, dec: float, detectors: list[int], collections: list[str]) -> list[Exposure]:

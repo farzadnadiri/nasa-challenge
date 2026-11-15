@@ -44,16 +44,18 @@ RESULT_VERSIONS = {
 # its CONTAINER_GEN. An old image still running during a rollout reports its own, older number, so
 # its answers are never cached under the new generation. Bump together with CONTAINER_GEN in
 # worker/wrangler.jsonc (tests/test_core.py checks they match).
-BACKEND_GEN = "22"
+BACKEND_GEN = "24"
 
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", Path(__file__).resolve().parents[1] / ".cache"))
 CACHE_TTL_DAYS = float(os.environ.get("CACHE_TTL_DAYS", "7"))  # SPHEREx ingests weekly
 
 TAP_DEADLINE_S = float(os.environ.get("TAP_DEADLINE_S", "240"))  # give up on a hung archive search
 FETCH_WORKERS = int(os.environ.get("FETCH_WORKERS", "24"))
-MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "3"))
+MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "4"))  # detector jobs running at once
+PART_FETCH_WORKERS = int(os.environ.get("PART_FETCH_WORKERS", "12"))   # download threads per detector job
 ABORT_AFTER_FAILURES = 10  # first N cutouts all failed -> stop the job
-MAX_EXPOSURES = int(os.environ.get("MAX_EXPOSURES", "600"))
+MAX_EXPOSURES = int(os.environ.get("MAX_EXPOSURES", "600"))  # per view in exposure mode (frames sent)
+MAX_EXPOSURES_PER_DETECTOR = int(os.environ.get("MAX_EXPOSURES_PER_DETECTOR", "300"))
 
 PIXEL_SCALE_ARCSEC = 6.15  # native SPHEREx pixel
 MIN_FOV_DEG = 0.02

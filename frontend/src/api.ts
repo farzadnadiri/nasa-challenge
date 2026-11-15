@@ -55,6 +55,7 @@ export interface FramesResult {
   status: 'queued' | 'querying' | 'fetching' | 'done' | 'error'
   error: string | null
   progress: { done: number; total: number; failed: number }
+  parts?: { detector: number; status: string; done: number; total: number }[]
   grid: Grid
   epochs: Epoch[]
   frames: Frame[]

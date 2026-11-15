@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+from types import SimpleNamespace
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -50,6 +51,9 @@ class Job:
     movers: dict | None = None   # moving-source search result, computed once the job is done
     contams: list = field(default_factory=list)  # per-exposure contamination masks (uint8), aligned with images
     refresh_wait: float = 0.0    # seconds until this view may be refreshed again (last refresh request)
+    planned: list = field(default_factory=list)  # every exposure the archive search returned (obsid, detector, mjd)
+    polled: float = field(default_factory=time.time)  # last time someone asked for this job (queue priority)
+    parts: list = field(default_factory=list)    # a view's detector jobs: [{detector, status, done, total}]
 
     def snapshot(self):
         with self.lock:
@@ -58,7 +62,41 @@ class Job:
 
 _jobs: dict[str, Job] = {}
 _jobs_lock = threading.Lock()
-_job_slots = threading.Semaphore(config.MAX_CONCURRENT_JOBS)
+ABANDON_S = 45  # a queued job nobody has asked about for this long gives up its place
+
+
+class _Slots:
+    """At most MAX_CONCURRENT_JOBS jobs process at once. A free slot goes to the waiting job that
+    was asked for most recently (the view someone is looking at), not the oldest one; a queued job
+    nobody asks about any more gives up its place, and starts again if it is asked for later."""
+
+    def __init__(self, n: int):
+        self.cv = threading.Condition()
+        self.free = n
+        self.waiting: list[Job] = []
+
+    def acquire(self, job: Job) -> bool:
+        with self.cv:
+            self.waiting.append(job)
+            try:
+                while True:
+                    if time.time() - job.polled > ABANDON_S:
+                        return False
+                    if self.free > 0 and job is max(self.waiting, key=lambda j: j.polled):
+                        self.free -= 1
+                        return True
+                    self.cv.wait(timeout=2)
+            finally:
+                self.waiting.remove(job)
+                self.cv.notify_all()
+
+    def release(self):
+        with self.cv:
+            self.free += 1
+            self.cv.notify_all()
+
+
+_slots = _Slots(config.MAX_CONCURRENT_JOBS)
 
 
 def job_key(ra: float, dec: float, fov: float, detectors: list[int], collections: list[str]) -> str:
@@ -76,8 +114,81 @@ def _restore(key: str) -> Job | None:
         return _load_cached(key)
 
 
+ALL_DETECTORS = [1, 2, 3, 4, 5, 6]
+_views: dict[str, tuple[tuple, Job]] = {}
+
+
 def get_or_start(ra: float, dec: float, fov: float, detectors: list[int], collections: list[str],
                  refresh: bool = False) -> Job:
+    """A view: one job per detector, combined. Each detector is processed (and stored) once, so
+    adding a detector processes only that one, and removing one or returning to a set seen before
+    needs no download at all."""
+    dets = sorted(set(detectors))
+    parts = [_get_or_start_part(ra, dec, fov, [d], collections, refresh) for d in dets]
+    key = job_key(ra, dec, fov, dets, collections)
+    sig = tuple((p.key, p.status, len(p.metas), p.started) for p in parts)
+    with _jobs_lock:
+        cached = _views.get(key)
+        if cached and cached[0] == sig:
+            view = cached[1]  # unchanged parts: same object, so its movers result is kept
+        else:
+            view = _combine(key, ra, dec, fov, dets, collections, parts)
+            _views[key] = (sig, view)
+    view.refresh_wait = max((p.refresh_wait for p in parts), default=0.0)
+    return view
+
+
+def _epoch_of(mjd: float, epochs: list[dict]) -> int:
+    for e in epochs:
+        if e["mjd_start"] - 1 <= mjd <= e["mjd_end"] + 1:
+            return e["index"]
+    return min(epochs, key=lambda e: abs(e["mjd_mid"] - mjd))["index"] if epochs else -1
+
+
+def _combine(key, ra, dec, fov, dets, collections, parts: list[Job]) -> Job:
+    """The view's job, assembled from its detector jobs (no pixels are copied)."""
+    view = Job(key, ra, dec, fov, dets, list(collections))
+    statuses = {p.status for p in parts}
+    errors = [p.error for p in parts if p.status == "error"]
+    if errors:
+        view.status, view.error = "error", errors[0]
+    elif statuses == {"done"}:
+        view.status = "done"
+    elif "fetching" in statuses or any(p.metas for p in parts):
+        view.status = "fetching"
+    elif "querying" in statuses:
+        view.status = "querying"
+    else:
+        view.status = "queued"
+    view.n = max((p.n for p in parts), default=0)
+    view.total = sum(p.total for p in parts)
+    view.failed = sum(p.failed for p in parts)
+    view.started = min((p.started for p in parts), default=time.time())
+    view.fresh = any(p.fresh for p in parts)
+    metas, planned = [], []
+    for p in parts:
+        with p.lock:
+            m, im, v, c = list(p.metas), list(p.images), list(p.variances), list(p.contams)
+        metas += m
+        view.images += im
+        view.variances += v
+        view.contams += c + [None] * (len(im) - len(c))
+        planned += p.planned or [{"obsid": x.get("obsid"), "detector": x.get("detector"), "mjd": x["mjd"]} for x in m]
+    # Epochs over every exposure the view will have, as a single job for these detectors would
+    # group them; each measured exposure then joins its epoch by (obsid, detector).
+    items = [SimpleNamespace(mjd=q["mjd"], epoch=-1, k=(q.get("obsid"), q.get("detector"))) for q in planned]
+    view.epochs = assign_epochs(items)
+    ep_of = {it.k: it.epoch for it in items}
+    view.metas = [{**m, "epoch": ep_of.get((m.get("obsid"), m.get("detector")), _epoch_of(m["mjd"], view.epochs))}
+                  for m in metas]
+    view.planned = planned
+    view.parts = [{"detector": p.detectors[0], "status": p.status, "done": len(p.metas), "total": p.total}
+                  for p in parts]
+    return view
+
+
+def _get_or_start_part(ra: float, dec: float, fov: float, detectors: list[int], collections: list[str],
+                       refresh: bool = False) -> Job:
     """refresh=True re-runs the archive search for a finished view ('check for new data'), at most
     once per REFRESH_MIN_S per view so the archive cannot be hammered."""
     key = job_key(ra, dec, fov, detectors, collections)
@@ -93,6 +204,7 @@ def get_or_start(ra: float, dec: float, fov: float, detectors: list[int], collec
             job = Job(key, ra, dec, fov, sorted(detectors), list(collections), fresh=True)
         elif job and job.status != "error":
             job.refresh_wait = max(0.0, config.REFRESH_MIN_S - (time.time() - job.started)) if refresh else 0.0
+            job.polled = time.time()
             _jobs[key] = job
             return job
         else:
@@ -116,6 +228,7 @@ def get_or_start_dataset(dataset: str, ra: float | None, dec: float | None) -> J
     with _jobs_lock:
         job = _jobs.get(key) or job
         if job and job.status != "error":
+            job.polled = time.time()
             _jobs[key] = job
             return job
         job = Job(key, ra or 0.0, dec or 0.0, 0.0, [0], [f"upload:{dataset}"], dataset=dataset, target=target)
@@ -205,7 +318,13 @@ def _limit(exps: list[Exposure], limit: int) -> list[Exposure]:
 
 
 def _run(job: Job):
-    with _job_slots:
+    if not _slots.acquire(job):
+        # Abandoned while queued: forget it, so a later request starts it afresh.
+        with _jobs_lock:
+            if _jobs.get(job.key) is job:
+                del _jobs[job.key]
+        return
+    try:
         try:
             if job.dataset:
                 _run_dataset(job)
@@ -213,8 +332,12 @@ def _run(job: Job):
                 _save_cached(job)
                 return
             job.status = "querying"
-            exps = query_exposures(job.ra, job.dec, job.detectors, job.collections, fresh=job.fresh)
-            exps = _limit(exps, config.MAX_EXPOSURES)
+            # One search for all detectors (the archive returns them all anyway): the other
+            # detector jobs of this position reuse it.
+            exps = query_exposures(job.ra, job.dec, ALL_DETECTORS, job.collections, fresh=job.fresh)
+            exps = [e for e in exps if e.detector in job.detectors]
+            exps = _limit(exps, config.MAX_EXPOSURES_PER_DETECTOR * len(job.detectors))
+            job.planned = [{"obsid": e.obsid, "detector": e.detector, "mjd": e.mjd} for e in exps]
             job.epochs = assign_epochs(exps)
             if not exps:
                 job.status = "done"
@@ -223,7 +346,7 @@ def _run(job: Job):
             grid, n = make_grid(job.ra, job.dec, job.fov)
             job.n, job.total = n, len(exps)
             job.status = "fetching"
-            with ThreadPoolExecutor(max_workers=config.FETCH_WORKERS) as pool:
+            with ThreadPoolExecutor(max_workers=config.PART_FETCH_WORKERS) as pool:
                 futs = {pool.submit(process_exposure, e, job.ra, job.dec, job.fov, grid, n): e
                         for e in _interleave(exps)}
                 for f in as_completed(futs):
@@ -249,6 +372,8 @@ def _run(job: Job):
         except Exception as e:  # keep the server alive; report to client
             traceback.print_exc()
             job.status, job.error = "error", f"processing failed: {e}"
+    finally:
+        _slots.release()
 
 
 # ---------------------------------------------------------------- products
@@ -390,6 +515,8 @@ def exposure_list(job: Job) -> list[dict]:
 def exposure_frames(job: Job, wl_min=None, wl_max=None) -> list[dict]:
     metas, images, _ = job.snapshot()
     order = sorted((i for i, m in enumerate(metas) if _in_range(m, wl_min, wl_max)), key=lambda i: metas[i]["mjd"])
+    if len(order) > config.MAX_EXPOSURES:  # all six detectors can hold far more than a browser should get
+        order = [order[k] for k in sorted(set(np.linspace(0, len(order) - 1, config.MAX_EXPOSURES).round().astype(int)))]
     return [{"meta": {**metas[i], "contaminated": _contaminated(metas[i]), "saturated": _saturated(metas[i])},
              "image": images[i], "contam": _contam_map(job, [i])} for i in order]
 
@@ -463,7 +590,7 @@ def _save_cached(job: Job):
         "ra": job.ra, "dec": job.dec, "fov": job.fov, "detectors": job.detectors, "collections": job.collections, "n": job.n,
         "total": job.total, "failed": job.failed, "epochs": job.epochs, "metas": job.metas,
         "dataset": job.dataset, "pixel_scale": job.pixel_scale, "units": job.units, "info": job.info,
-        "saved": time.time(),
+        "planned": job.planned, "saved": time.time(),
     }))
 
     # Copy to the shared store in the background (the npz first: the json marks it complete).
@@ -489,6 +616,7 @@ def _load_cached(key: str) -> Job | None:
     job = Job(key, d["ra"], d["dec"], d["fov"], d["detectors"], d.get("collections", []), status="done", n=d["n"],
               total=d["total"], failed=d["failed"], epochs=d["epochs"], metas=d["metas"], started=d["saved"])
     job.dataset, job.units, job.info = d.get("dataset"), d.get("units", "MJy/sr"), d.get("info", {})
+    job.planned = d.get("planned", [])
     job.pixel_scale = d.get("pixel_scale", config.PIXEL_SCALE_ARCSEC)
     job.images = list(arr["images"])
     job.contams = list(arr["contams"]) if "contams" in arr.files else [None] * len(job.images)

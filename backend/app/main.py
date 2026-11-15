@@ -166,6 +166,7 @@ def frames(
         "grid": {"n": n, "ra": job.ra, "dec": job.dec, "fov": _fov(fov),
                  "pixel_scale_arcsec": job.pixel_scale},
         "detectors": job.detectors,
+        "parts": job.parts,  # per detector: status and exposures loaded
         "collections": job.collections,
         "dataset": job.info if job.dataset and job.info else None,  # filled in once the files are checked
         "refresh_wait_s": round(job.refresh_wait) if refresh else 0,

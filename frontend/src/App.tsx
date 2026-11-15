@@ -62,6 +62,16 @@ export default function App() {
     return REF_SOURCES.some((s) => s.id === r) ? (r as RefSource) : 'unwise'
   })
   const [dets, setDets] = useState<number[]>(init.params?.dets ?? [5, 6])
+  // The checkboxes edit a draft; the view follows once clicking stops, so ticking three boxes
+  // starts one search instead of three.
+  const [detsDraft, setDetsDraft] = useState<number[]>(dets)
+  useEffect(() => {
+    if (detsDraft.join() === dets.join()) return
+    const t = setTimeout(() => setDets(detsDraft), 800)
+    return () => clearTimeout(t)
+  }, [detsDraft]) // eslint-disable-line react-hooks/exhaustive-deps
+  // Shown over the image while another mode or detector set loads (the current view stays up).
+  const [switching, setSwitching] = useState<string | null>(null)
   const [mode, setMode] = useState<ViewMode>(init.params?.mode ?? 'epoch')
   // Which SPHEREx data: 'auto' (newest data + quick release) or one release; optionally Deep Fields.
   const [release, setRelease] = useState(() => {
@@ -187,12 +197,20 @@ export default function App() {
     // until the re-cropped ones arrive (the backend serves them from the same job).
     const prev = prevParams.current
     // Object.is: an upload without a chosen target has NaN coordinates (NaN !== NaN).
-    const sameView = !!prev && Object.is(prev.ra, params.ra) && Object.is(prev.dec, params.dec) && prev.mode === params.mode && prev.dataset === params.dataset
-      && prev.dets.join() === params.dets.join() && prev.release === params.release && prev.deep === params.deep
+    // Another mode or detector set of the same place also keeps the current view on screen (and the
+    // reference panel, with Aladin, mounted) until the new frames arrive.
+    const samePlace = !!prev && Object.is(prev.ra, params.ra) && Object.is(prev.dec, params.dec) && prev.dataset === params.dataset
+      && prev.release === params.release && prev.deep === params.deep
+    const modeChanged = samePlace && prev!.mode !== params.mode
+    const detsChanged = samePlace && prev!.dets.join() !== params.dets.join()
+    const sameView = samePlace
     let refresh = refreshNext.current
     refreshNext.current = false
     prevParams.current = params
     if (!sameView) { setResult(null); setIndex(0) }
+    setSwitching(modeChanged ? `Loading the ${params.mode === 'wavelength' ? 'wavelength' : params.mode === 'exposure' ? 'exposure' : 'epoch'} view…`
+      : detsChanged ? 'Loading the new detector selection…' : null)
+    let first = true
     setPick(null); setPhot(null)
     let failures = 0
     const tick = async () => {
@@ -205,6 +223,11 @@ export default function App() {
         }
         refresh = false
         failures = 0
+        if (first) {
+          first = false
+          if (modeChanged) setIndex(0)
+          setSwitching(null)
+        }
         setResult(r)
         if (r.status === 'done' && refreshFrom.current != null) {
           const added = r.progress.total - refreshFrom.current
@@ -366,6 +389,11 @@ export default function App() {
   const hoverSky = geom && hover ? pixelToSky(geom, hover[0], hover[1]) : null
   const frame = viewFrames[index]
   const progress = result?.progress
+  // Per detector, so a wait is visible: "D1 waiting · D5 ready · D6 120/300".
+  const partsLine = (result?.parts?.length ?? 0) > 1 || result?.parts?.some((p) => p.status !== 'done')
+    ? result!.parts!.map((p) => `D${p.detector} ${p.status === 'done' ? 'ready' : p.status === 'queued' ? 'waiting'
+      : p.status === 'querying' ? 'searching' : p.status === 'error' ? 'failed' : `${p.done}/${p.total}`}`).join(' · ')
+    : null
   // A view is set but its first response hasn't arrived yet also counts as loading.
   const running = !!params && !error && (!result || (result.status !== 'done' && result.status !== 'error'))
 
@@ -422,6 +450,7 @@ export default function App() {
           {grid?.n ? (
             <div className="panes">
               <div className="pane">
+              {switching && <div className="switching" role="status"><span className="spinner spinner-sm" aria-hidden="true" />{switching}</div>}
               <Viewer grid={grid} frames={viewFrames} index={index} stretch={viewStretch} smooth={smooth}
                 gaia={showGaia ? gaia : null} gaiaEpoch={2016.0} movers={findMovers ? moversRes?.movers : null}
                 catwise={showWise ? catwise : null} catwiseEpoch={2015.4} showContam={showContam}
@@ -503,6 +532,7 @@ export default function App() {
                 <div className="progress" aria-live="polite">
                   <div className="bar"><div style={{ width: `${(100 * progress.done) / progress.total}%` }} /></div>
                   <span>Loading exposures {progress.done}/{progress.total}{progress.failed ? ` (${progress.failed} failed)` : ''}. Frames sharpen as data arrives.</span>
+                  {partsLine && <span className="muted small">{partsLine}</span>}
                 </div>
               )}
 
@@ -535,11 +565,12 @@ export default function App() {
                 <p>
                   <span className="spinner" aria-hidden="true" />{' '}
                   {busy ? 'Looking up the target…'
-                    : result?.status === 'queued' ? 'Waiting for another search to finish…'
+                    : result?.status === 'queued' ? 'Waiting for a free processing slot (other views are being processed)…'
                     : result?.status === 'querying' ? 'Searching the SPHEREx archive…'
                     : result?.status === 'fetching' ? 'Loading the first exposures…'
                     : 'Starting…'}
-                  <br /><small className="muted">A new position takes about 10–30 seconds; after that it is cached.</small>
+                  <br /><small className="muted">A new position takes about 10–30 seconds per detector; after that it is cached.</small>
+                  {partsLine && <><br /><small className="muted">{partsLine}</small></>}
                 </p>
               ) : (
                 <p>Pick a target above or enter coordinates.</p>
@@ -725,8 +756,8 @@ export default function App() {
             <div className="dets">
               {DETECTORS.map(({ d, range }) => (
                 <label key={d} className="check" title={range}>
-                  <input type="checkbox" checked={dets.includes(d)}
-                    onChange={(e) => setDets((cur) => {
+                  <input type="checkbox" checked={detsDraft.includes(d)}
+                    onChange={(e) => setDetsDraft((cur) => {
                       const next = e.target.checked ? [...cur, d] : cur.filter((x) => x !== d)
                       return next.length ? next.sort() : cur
                     })} />

@@ -2,13 +2,14 @@
 
     python prewarm.py                       # against a local server on :8000
     python prewarm.py https://<worker-url>  # against the deployed Worker (fills R2 too)
+    python prewarm.py https://<worker-url> --all-detectors   # also process D1-D4 for the targets
 """
 import sys
 import time
 
 import httpx
 
-BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000").rstrip("/")
+BASE = next((a for a in sys.argv[1:] if not a.startswith("--")), "http://localhost:8000").rstrip("/")
 TARGETS = [  # (query, fov deg, detectors) matching the frontend presets
     ("Barnard's Star", 0.1, "5,6"),
     ("eps Ind B", 0.1, "5,6"),
@@ -47,7 +48,12 @@ def warm(client: httpx.Client, q: str, fov: float, dets: str):
 
 
 if __name__ == "__main__":
-    # Not run in parallel: the backend processes at most two jobs at once anyway.
+    # Not run in parallel: the backend runs a few detector jobs at a time anyway.
     with httpx.Client(timeout=300) as c:
         for t in TARGETS:
             warm(c, *t)
+        # Then every detector once: the backend keeps one job per detector, so afterwards any
+        # combination of D1-D6 for these targets loads without processing.
+        if "--all-detectors" in sys.argv:
+            for q, fov, _ in TARGETS:
+                warm(c, q, fov, "1,2,3,4,5,6")

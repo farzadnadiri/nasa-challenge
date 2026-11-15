@@ -92,7 +92,8 @@ function fillSaturated(f: Float32Array, n: number, hi: number): Float32Array {
 }
 
 export function renderToImageData(f: Float32Array | null, n: number, lim: [number, number], o: StretchOpts): ImageData {
-  if (f && o.display === 'frames') f = fillSaturated(f, n, lim[1])
+  // Only frames with masked pixels need the (slow) saturated-core fill.
+  if (f && o.display === 'frames' && f.some((v) => !Number.isFinite(v))) f = fillSaturated(f, n, lim[1])
   const img = new ImageData(n, n)
   const px = img.data
   const [lo, hi] = lim

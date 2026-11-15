@@ -19,7 +19,7 @@
   // image stacks are kept in R2, so a new container loads them instead of rebuilding.
   "vars": {
     "PUBLIC_URL": "https://spherex.peykan.ai",
-    "CONTAINER_GEN": "22",
+    "CONTAINER_GEN": "24",
     "RESULT_VERSIONS": { "frames": "4.1", "exposures": "4.1", "photometry": "4.2", "movers": "4.5", "gaia": "2", "catwise": "1" }
   },
   "secrets": { "required": ["IRSA_PROXY_KEY"] },
