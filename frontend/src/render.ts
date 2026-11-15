@@ -1,7 +1,8 @@
 // Turns float images into pixels. One stretch is computed across ALL frames so a star that
 // looks brighter in one frame really is brighter (per-frame autoscaling would hide variability).
 
-export type Display = 'frames' | 'difference'
+/** 'signed': already a difference (e.g. epoch A minus B); shown on a symmetric scale as is. */
+export type Display = 'frames' | 'difference' | 'signed'
 export type Transfer = 'asinh' | 'linear'
 
 export interface StretchOpts {
@@ -30,7 +31,7 @@ export function meanFrame(frames: (Float32Array | null)[]): Float32Array | null 
 
 /** Frames to display, after optional difference against the mean of all frames. */
 export function displayFrames(frames: (Float32Array | null)[], display: Display): (Float32Array | null)[] {
-  if (display === 'frames') return frames
+  if (display !== 'difference') return frames
   const ref = meanFrame(frames)
   if (!ref) return frames
   return frames.map((f) => {
@@ -52,11 +53,11 @@ export function computeLimits(frames: (Float32Array | null)[], o: StretchOpts): 
   for (const f of frames) {
     if (!f) continue
     const step = Math.max(1, Math.floor(f.length / 20000)) // subsample big frames
-    for (let i = 0; i < f.length; i += step) if (Number.isFinite(f[i])) vals.push(o.display === 'difference' ? Math.abs(f[i]) : f[i])
+    for (let i = 0; i < f.length; i += step) if (Number.isFinite(f[i])) vals.push(o.display === 'frames' ? f[i] : Math.abs(f[i]))
   }
   if (!vals.length) return [0, 1]
   const s = Float32Array.from(vals).sort()
-  if (o.display === 'difference') {
+  if (o.display !== 'frames') {
     const m = percentile(s, o.highPct) || 1
     return [-m, m]
   }

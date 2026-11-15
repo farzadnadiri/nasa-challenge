@@ -14,7 +14,7 @@
   // IRSA_PROXY_KEY is a secret: `npx wrangler secret put IRSA_PROXY_KEY`.
   // Bump CONTAINER_GEN when the backend changes: requests then go to a fresh container running
   // the new image instead of the old instance, which only retires after 30 idle minutes.
-  "vars": { "PUBLIC_URL": "https://spherex.peykan.ai", "CONTAINER_GEN": "4" },
+  "vars": { "PUBLIC_URL": "https://spherex.peykan.ai", "CONTAINER_GEN": "12" },
   "secrets": { "required": ["IRSA_PROXY_KEY"] },
 
   // React build, served directly; /api/* goes through the Worker first.
@@ -40,5 +40,11 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SpherexApi"] }],
 
   // Finished results (frames, photometry, Gaia) keyed by normalised query string.
-  "r2_buckets": [{ "binding": "CACHE", "bucket_name": "spherex-cache" }]
+  "r2_buckets": [{ "binding": "CACHE", "bucket_name": "spherex-cache" }],
+
+  // Per-visitor limits for uploads (Cloudflare's limiter counts per 60 s).
+  "ratelimits": [
+    { "name": "UPLOAD_CREATE_LIMIT", "namespace_id": "2001", "simple": { "limit": 3, "period": 60 } },
+    { "name": "UPLOAD_FILE_LIMIT", "namespace_id": "2002", "simple": { "limit": 60, "period": 60 } }
+  ]
 }

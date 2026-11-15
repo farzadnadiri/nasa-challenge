@@ -8,17 +8,29 @@ IRSA_PUBLIC = "https://irsa.ipac.caltech.edu/"
 IRSA_BASE = os.environ.get("IRSA_BASE", IRSA_PUBLIC)
 IRSA_PROXY_KEY = os.environ.get("IRSA_PROXY_KEY", "")
 IRSA_HEADERS = {"X-Proxy-Key": IRSA_PROXY_KEY} if IRSA_PROXY_KEY else {}
+# Uploaded datasets are read through the Worker's internal /api/_upload/ route (same key).
+UPLOAD_BASE = os.environ.get("UPLOAD_BASE", "http://localhost:8787/api/_upload/")
 IRSA_TAP = IRSA_BASE + "TAP/sync"
 IRSA_SIA = IRSA_BASE + "SIA"
-# Newest releases first; update when SPHEREx publishes a new release (QR2 is superseded).
-SIA_COLLECTIONS = os.environ.get("SIA_COLLECTIONS", "spherex_dr1,spherex_qr3").split(",")
+# Releases are discovered automatically (newest DR + newest QR, from the S3 bucket's folders).
+# Set SIA_COLLECTIONS (comma separated) to pin them; the defaults are used if discovery fails.
+SIA_COLLECTIONS = [c for c in os.environ.get("SIA_COLLECTIONS", "").split(",") if c]
+DEFAULT_SIA_COLLECTIONS = ("spherex_dr1", "spherex_qr3")
+RELEASE_REFRESH_S = 24 * 3600
+REFRESH_MIN_S = float(os.environ.get("REFRESH_MIN_S", "3600"))  # "check for new data" at most hourly per view
 # Public SPHEREx bucket; object keys are the IRSA paths without the ibe/data/spherex/ prefix.
 S3_BASE = os.environ.get("S3_BASE", "https://nasa-irsa-spherex.s3.us-east-1.amazonaws.com/")
 GAIA_TAP = os.environ.get("GAIA_TAP", "https://gea.esac.esa.int/tap-server/tap/sync")
+SIMBAD_TAP = os.environ.get("SIMBAD_TAP", "https://simbad.cfa.harvard.edu/simbad/sim-tap/sync")  # Harvard mirror
 SESAME = os.environ.get("SESAME", "https://cds.unistra.fr/cgi-bin/nph-sesame/-oxp/SNV")
 
 # Bump when processing changes, so stale cached results are not served.
 PIPELINE_VERSION = "3"
+# Baked into the image and sent as X-Backend-Gen; the Worker caches a response only when this matches
+# its CONTAINER_GEN. An old image still running during a rollout reports its own, older number, so
+# its answers are never cached under the new generation. Bump together with CONTAINER_GEN in
+# worker/wrangler.jsonc (tests/test_core.py checks they match).
+BACKEND_GEN = "12"
 
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", Path(__file__).resolve().parents[1] / ".cache"))
 CACHE_TTL_DAYS = float(os.environ.get("CACHE_TTL_DAYS", "7"))  # SPHEREx ingests weekly
@@ -41,6 +53,7 @@ JOB_FOV_TIERS_DEG = (0.15, 0.25)
 # poles) are split into windows of at most EPOCH_MAX_SPAN_DAYS.
 EPOCH_GAP_DAYS = 20.0
 EPOCH_MAX_SPAN_DAYS = 30.0
+CHANNELS_PER_DETECTOR = 17  # SPHEREx: 6 detectors x 17 channels = 102 bands
 MIN_EPOCH_EXPOSURES = 5  # fewer than this (or <20% of the median epoch) is marked shallow
 
 # FLAGS bits that make a pixel unusable. Names are looked up in each file's FLAGS header,

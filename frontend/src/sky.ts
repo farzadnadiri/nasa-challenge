@@ -53,3 +53,20 @@ function sexa(v: number, sign: boolean, digits: number): string {
 
 export const formatRA = (ra: number) => sexa(ra / 15, false, 2)
 export const formatDec = (dec: number) => sexa(dec, true, 1)
+
+/** "150.1 2.2", "10:00:24 +02:12:00", "10h00m24s +02d12m00s" or "10 00 24 +02 12 00" -> [ra, dec] degrees. */
+export function parseTargetInput(text: string): [number, number] | null {
+  const t = text.trim().replace(/,/g, ' ')
+  const nums = t.split(/\s+/)
+  if (nums.length === 2 && nums.every((n) => /^[+-]?\d+(\.\d*)?$/.test(n))) {
+    const ra = parseFloat(nums[0]), dec = parseFloat(nums[1])
+    return ra >= 0 && ra < 360 && Math.abs(dec) <= 90 ? [ra, dec] : null
+  }
+  const parts = t.replace(/[hdms:°′″'"]/gi, ' ').trim().split(/\s+/)
+  if (parts.length !== 6 || !parts.every((n) => /^[+-]?\d+(\.\d*)?$/.test(n))) return null
+  const [h, m, s, d, dm, ds] = parts.map(parseFloat)
+  const sign = parts[3].startsWith('-') ? -1 : 1
+  const ra = (h + m / 60 + s / 3600) * 15
+  const dec = sign * (Math.abs(d) + dm / 60 + ds / 3600)
+  return ra >= 0 && ra < 360 && Math.abs(dec) <= 90 ? [ra, dec] : null
+}

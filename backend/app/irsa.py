@@ -59,57 +59,131 @@ def _tap_query(adql: str, retries: int = 3) -> Table:
     raise UpstreamError(f"IRSA search service is unavailable ({last}). Try again shortly.")
 
 
-def _cache_path(ra: float, dec: float, detectors: list[int]):
-    key = hashlib.sha1(f"q|{ra:.4f}|{dec:.4f}|{sorted(detectors)}".encode()).hexdigest()[:16]
+def _cache_path(ra: float, dec: float, detectors: list[int], collections: list[str]):
+    # The release list is part of the key, so a newly discovered release is searched straight away.
+    key = hashlib.sha1(f"q|{ra:.4f}|{dec:.4f}|{sorted(detectors)}|{sorted(collections)}".encode()).hexdigest()[:16]
     config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
     return config.CACHE_DIR / f"query_{key}.json"
 
 
-def query_exposures(ra: float, dec: float, detectors: list[int]) -> list[Exposure]:
+def query_exposures(ra: float, dec: float, detectors: list[int], collections: list[str] | None = None,
+                    fresh: bool = False) -> list[Exposure]:
     """All spectral images whose footprint contains (ra, dec), oldest first.
 
     Uses TAP rather than SIA: TAP sees new data immediately after the weekly ingest.
     Results are cached on disk for CACHE_TTL_DAYS (SPHEREx ingests weekly), which also
     protects the demo from IRSA search outages.
     """
-    path = _cache_path(ra, dec, detectors)
-    if path.exists() and time.time() - path.stat().st_mtime < config.CACHE_TTL_DAYS * 86400:
+    collections = collections or current_collections()
+    path = _cache_path(ra, dec, detectors, collections)
+    if not fresh and path.exists() and time.time() - path.stat().st_mtime < config.CACHE_TTL_DAYS * 86400:
         return [Exposure(**{**d, "epoch": -1}) for d in json.loads(path.read_text())]
-    exps = _query_exposures_live(ra, dec, detectors)
+    exps = _query_exposures_live(ra, dec, detectors, collections)
     path.write_text(json.dumps([e.to_dict() for e in exps]))
     return exps
 
 
-def _query_exposures_live(ra: float, dec: float, detectors: list[int]) -> list[Exposure]:
+def _query_exposures_live(ra: float, dec: float, detectors: list[int], collections: list[str]) -> list[Exposure]:
     """SIA first (fast, ~1 day ingest lag), TAP as fallback; either one can be down."""
     errors = []
     for fn in (_query_sia, _query_tap):
         try:
-            return fn(ra, dec, detectors)
+            return fn(ra, dec, detectors, collections)
         except UpstreamError as e:
             errors.append(str(e))
     raise UpstreamError(" / ".join(errors))
 
 
-def _query_sia(ra: float, dec: float, detectors: list[int]) -> list[Exposure]:
-    params = [("COLLECTION", c) for c in config.SIA_COLLECTIONS]
-    params += [("POS", f"circle {ra:.7f} {dec:.7f} 0.0003"), ("RESPONSEFORMAT", "votable")]
-    try:
-        r = httpx.get(config.IRSA_SIA, params=params, headers=config.IRSA_HEADERS,
-                      timeout=httpx.Timeout(connect=15, read=config.TAP_DEADLINE_S, write=15, pool=15))
-    except httpx.HTTPError as e:
-        raise UpstreamError(f"IRSA SIA unavailable ({type(e).__name__})")
-    if r.status_code != 200:
-        raise UpstreamError(f"IRSA SIA unavailable (HTTP {r.status_code})")
-    t = Table.read(io.BytesIO(r.content), format="votable", use_names_over_ids=True)
-    wanted = {f"SPHEREx-D{d}" for d in detectors}
+# ---------------------------------------------------------------- data releases
+
+_RELEASE_NAME_RE = re.compile(r"^(dr|qr)(\d+)$")
+_releases_cache: tuple[float, list[str]] | None = None
+
+
+def release_rank(name: str) -> int:
+    """Newer is higher: any DR outranks any QR; within a kind, the higher number wins."""
+    m = _RELEASE_NAME_RE.match(name or "")
+    if not m:
+        return 0
+    return (1000 if m.group(1) == "dr" else 0) + int(m.group(2))
+
+
+def pick_releases(names: list[str]) -> list[str]:
+    """Newest data release plus newest quick release (QRs carry data not yet in a DR)."""
     out = []
-    for row in t:
-        band = str(row["energy_bandpassname"])
-        if band not in wanted or str(row["dataproduct_subtype"]) != "science":
+    for kind in ("dr", "qr"):
+        same = [n for n in names if n.startswith(kind) and _RELEASE_NAME_RE.match(n)]
+        if same:
+            out.append(max(same, key=release_rank))
+    return out
+
+
+def available_releases() -> list[str]:
+    """Release names in the public S3 bucket (dr1, qr3, ...), newest first; listed once a day.
+    A new release folder is picked up without any code change."""
+    global _releases_cache
+    if _releases_cache and time.time() - _releases_cache[0] < config.RELEASE_REFRESH_S:
+        return _releases_cache[1]
+    try:
+        r = httpx.get(config.S3_BASE, params={"list-type": "2", "delimiter": "/"}, timeout=20)
+        names = [p.strip("/") for p in re.findall(r"<Prefix>([^<]+)</Prefix>", r.text)]
+        found = sorted((n for n in names if _RELEASE_NAME_RE.match(n)), key=release_rank, reverse=True)
+    except httpx.HTTPError:
+        found = []
+    if not found:  # bucket unreachable: fall back to the configured defaults, don't cache the failure long
+        return [c.removeprefix("spherex_") for c in config.DEFAULT_SIA_COLLECTIONS]
+    _releases_cache = (time.time(), found)
+    return found
+
+
+def valid_release(name: str) -> bool:
+    return name == "auto" or bool(_RELEASE_NAME_RE.match(name or ""))
+
+
+def resolve_collections(release: str = "auto", deep: bool = False) -> list[str]:
+    """SIA collections for a user choice: 'auto' = newest DR + newest QR (or SIA_COLLECTIONS if
+    pinned), otherwise that one release. deep=True adds the matching Deep Field collections."""
+    if release == "auto":
+        if config.SIA_COLLECTIONS and not deep:
+            return list(config.SIA_COLLECTIONS)
+        names = pick_releases(available_releases())
+    else:
+        names = [release]
+    cols = [f"spherex_{n}" for n in names]
+    if deep:
+        cols += [f"spherex_{n}_deep" for n in names]
+    return cols
+
+
+def current_collections() -> list[str]:
+    """Default collections ('auto', wide survey only)."""
+    return resolve_collections("auto", False)
+
+
+def _query_sia(ra: float, dec: float, detectors: list[int], collections: list[str]) -> list[Exposure]:
+    """One request per collection, so a release IRSA's SIA does not serve yet cannot break the rest."""
+    wanted = {f"SPHEREx-D{d}" for d in detectors}
+    out, errors = [], []
+    for col in collections:
+        params = [("COLLECTION", col), ("POS", f"circle {ra:.7f} {dec:.7f} 0.0003"), ("RESPONSEFORMAT", "votable")]
+        try:
+            r = httpx.get(config.IRSA_SIA, params=params, headers=config.IRSA_HEADERS,
+                          timeout=httpx.Timeout(connect=15, read=config.TAP_DEADLINE_S, write=15, pool=15))
+        except httpx.HTTPError as e:
+            errors.append(f"{col}: {type(e).__name__}")
             continue
-        out.append(_exposure(str(row["access_url"]).replace(config.IRSA_PUBLIC, ""),
-                             float(row["t_min"]), int(band[-1])))
+        if r.status_code != 200:
+            errors.append(f"{col}: HTTP {r.status_code}")
+            continue
+        t = Table.read(io.BytesIO(r.content), format="votable", use_names_over_ids=True)
+        for row in t:
+            band = str(row["energy_bandpassname"])
+            if band not in wanted or str(row["dataproduct_subtype"]) != "science":
+                continue
+            out.append(_exposure(str(row["access_url"]).replace(config.IRSA_PUBLIC, ""),
+                                 float(row["t_min"]), int(band[-1])))
+    if not out and errors:
+        raise UpstreamError(f"IRSA SIA unavailable ({'; '.join(errors)})")
     return dedupe(out)
 
 
@@ -120,7 +194,7 @@ def _exposure(uri: str, mjd: float, det: int) -> Exposure:
                     obsid=m.group(1) if m else uri.rsplit("/", 1)[-1], release=rel.group(1) if rel else "")
 
 
-def _query_tap(ra: float, dec: float, detectors: list[int]) -> list[Exposure]:
+def _query_tap(ra: float, dec: float, detectors: list[int], collections: list[str]) -> list[Exposure]:
     bands = ", ".join(f"'SPHEREx-D{d}'" for d in sorted(detectors))
     adql = f"""
 SELECT a.uri, p.time_bounds_lower, p.energy_bandpassname
@@ -130,17 +204,19 @@ WHERE 1 = CONTAINS(POINT('ICRS', {ra:.7f}, {dec:.7f}), p.poly)
 ORDER BY p.time_bounds_lower
 """
     t = _tap_query(adql)
-    return dedupe([_exposure(str(row["uri"]), float(row["time_bounds_lower"]),
-                             int(str(row["energy_bandpassname"])[-1])) for row in t])
+    # TAP sees every release; keep only the chosen ones (Deep Field files live under the same names).
+    wanted = {c.removeprefix("spherex_").removesuffix("_deep") for c in collections}
+    exps = [_exposure(str(row["uri"]), float(row["time_bounds_lower"]), int(str(row["energy_bandpassname"])[-1]))
+            for row in t]
+    return dedupe([e for e in exps if e.release in wanted])
 
 
 def dedupe(exps: list[Exposure]) -> list[Exposure]:
-    """Keep one image per (obsid, detector), preferring the newest release (dr1 > qr3 > qr2)."""
-    rank = {"dr1": 3, "qr3": 2, "qr2": 1}
+    """Keep one image per (obsid, detector), preferring the newest release (see release_rank)."""
     best: dict[tuple, Exposure] = {}
     for e in exps:
         k = (e.obsid, e.detector)
-        if k not in best or rank.get(e.release, 0) > rank.get(best[k].release, 0):
+        if k not in best or release_rank(e.release) > release_rank(best[k].release):
             best[k] = e
     return sorted(best.values(), key=lambda e: e.mjd)
 

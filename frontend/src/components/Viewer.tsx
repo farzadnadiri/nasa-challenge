@@ -18,9 +18,42 @@ interface Props {
 
 const GAIA_MAX_MARKERS = 80 // brightest Gaia stars shown; SPHEREx sees few fainter ones, more is clutter
 
+// Common SIMBAD object types, in words (anything else is shown as SIMBAD's own code).
+const OTYPES: Record<string, string> = {
+  '*': 'star', '**': 'double or multiple star', 'PM*': 'high proper-motion star', 'BD*': 'brown dwarf',
+  'BY*': 'BY Draconis variable', 'Mi*': 'Mira variable', 'TT*': 'T Tauri star', 'V*': 'variable star',
+  'LP*': 'long-period variable', 'SB*': 'spectroscopic binary', 'EB*': 'eclipsing binary', 'RR*': 'RR Lyrae variable',
+  'WD*': 'white dwarf', 'RG*': 'red giant', 'LM*': 'low-mass star', 'Ro*': 'rotating variable', 'G': 'galaxy', 'QSO': 'quasar',
+}
+
+function StarTooltip({ star, x, y, size }: { star: GaiaSource; x: number; y: number; size: number }) {
+  const pm = Math.hypot(star.pmra ?? 0, star.pmdec ?? 0)
+  const plx = star.parallax ?? 0
+  const named = star.name && !star.name.startsWith('Gaia DR3')
+  const below = y < 120 // near the top: show under the marker
+  return (
+    <div className="star-tip" role="tooltip"
+      style={{ left: `${(x / size) * 100}%`, top: `${(y / size) * 100}%`,
+        transform: `translate(${x > size * 0.7 ? '-100%' : x < size * 0.3 ? '0' : '-50%'}, ${below ? '16px' : 'calc(-100% - 14px)'})` }}>
+      <div className="star-tip-name">{named ? star.name : `Gaia DR3 ${star.source_id}`}</div>
+      {star.otype && <div className="star-tip-type">{OTYPES[star.otype] ?? star.otype}</div>}
+      {named && <div className="muted">Gaia DR3 {star.source_id}</div>}
+      <dl>
+        {star.phot_g_mean_mag != null && <><dt>Brightness</dt><dd>G = {star.phot_g_mean_mag.toFixed(2)} mag</dd></>}
+        {star.bp_rp != null && <><dt>Colour</dt><dd>BP − RP = {star.bp_rp.toFixed(2)} {star.bp_rp > 2 ? '(red)' : star.bp_rp < 0.5 ? '(blue)' : ''}</dd></>}
+        {plx > 0.2 && <><dt>Distance</dt><dd>≈ {(1000 / plx).toFixed(plx > 10 ? 1 : 0)} pc ({((1000 / plx) * 3.2616).toFixed(plx > 10 ? 1 : 0)} light years)</dd></>}
+        <dt>Motion</dt><dd>{(pm / 1000).toFixed(pm > 1000 ? 2 : 3)}″ per year{pm > 200 ? ' (fast)' : ''}</dd>
+      </dl>
+    </div>
+  )
+}
+
 export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, pick, onPick, onHover }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
+  // Gaia markers as drawn in the current frame (canvas CSS px), for hover lookups.
+  const markersRef = useRef<{ s: GaiaSource; cx: number; cy: number }[]>([])
+  const [hoverStar, setHoverStar] = useState<{ s: GaiaSource; x: number; y: number } | null>(null)
   // Draw at the canvas's real on-screen size so text and lines stay crisp at any size.
   const [SIZE, setSize] = useState(640)
   useEffect(() => {
@@ -68,6 +101,7 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
 
     // Gaia DR3, carried from 2016.0 to this frame's date.
     const frame = frames[index]
+    markersRef.current = []
     if (gaia && frame) {
       const dt = frame.decimalYear - gaiaEpoch
       ctx.lineWidth = 1.25
@@ -83,6 +117,7 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
         const [cx, cy] = toCanvas(p[0], p[1])
         if (cx < -10 || cy < -10 || cx > SIZE + 10 || cy > SIZE + 10) continue
         shown++
+        markersRef.current.push({ s, cx, cy })
         const fast = Math.hypot(pmra, pmdec) > 200
         ctx.strokeStyle = fast ? 'rgba(255, 92, 92, 0.95)' : 'rgba(80, 200, 255, 0.7)'
         ctx.beginPath()
@@ -156,9 +191,21 @@ export function Viewer({ grid, frames, index, stretch, smooth, gaia, gaiaEpoch, 
         className="viewer"
         style={{ width: '100%', height: 'auto', aspectRatio: '1 / 1' }}
         onClick={(e) => onPick(...toGrid(e))}
-        onMouseMove={(e) => onHover(toGrid(e))}
-        onMouseLeave={() => onHover(null)}
+        onMouseMove={(e) => {
+          onHover(toGrid(e))
+          // Nearest drawn Gaia marker within 10 px of the pointer.
+          const r = e.currentTarget.getBoundingClientRect()
+          const x = (e.clientX - r.left) * (SIZE / r.width), y = (e.clientY - r.top) * (SIZE / r.height)
+          let best: { s: GaiaSource; cx: number; cy: number } | null = null, bd = 10
+          for (const m of markersRef.current) {
+            const d = Math.hypot(m.cx - x, m.cy - y)
+            if (d < bd) { bd = d; best = m }
+          }
+          setHoverStar(best ? { s: best.s, x: best.cx, y: best.cy } : null)
+        }}
+        onMouseLeave={() => { onHover(null); setHoverStar(null) }}
       />
+      {hoverStar && <StarTooltip star={hoverStar.s} x={hoverStar.x} y={hoverStar.y} size={SIZE} />}
     </div>
   )
 }

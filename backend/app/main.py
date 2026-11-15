@@ -10,7 +10,8 @@ from fastapi.responses import JSONResponse
 
 from . import config, gaia, jobs
 from .cutouts import make_grid
-from .irsa import UpstreamError
+from .uploads import UploadError
+from .irsa import UpstreamError, available_releases, pick_releases, resolve_collections, valid_release
 from .resolve import resolve as resolve_query
 
 app = FastAPI(title="SPHEREx Sky Motion Explorer API", version="0.1")
@@ -37,16 +38,38 @@ def _fov(fov: float) -> float:
     return min(max(fov, config.MIN_FOV_DEG), config.MAX_FOV_DEG)
 
 
-def _job(ra: float, dec: float, fov: float, dets: str) -> jobs.Job:
+def _job(ra: float, dec: float, fov: float, dets: str, release: str = "auto", deep: bool = False,
+         refresh: bool = False) -> jobs.Job:
+    if not valid_release(release):
+        raise HTTPException(400, "release must be 'auto' or a name such as dr1 or qr3")
     tier = next(t for t in config.JOB_FOV_TIERS_DEG if t >= _fov(fov) - 1e-9)
-    return jobs.get_or_start(ra % 360.0, dec, tier, _detectors(dets))
+    return jobs.get_or_start(ra % 360.0, dec, tier, _detectors(dets), resolve_collections(release, deep), refresh)
+
+
+# Which SPHEREx data a view uses: 'auto' (newest data + quick release) or one named release,
+# optionally with that release's Deep Field collection.
+RELEASE_Q = Query("auto", max_length=12, description="auto, or a release name such as dr1 or qr3")
+DEEP_Q = Query(False, description="also search the Deep Field collections")
+DATASET_Q = Query(None, max_length=32, description="id of an uploaded dataset instead of the SPHEREx archive")
+
+
+def _view_job(ra, dec, fov, dets, release, deep, dataset, refresh=False) -> jobs.Job:
+    """The job behind a view: an uploaded dataset, or SPHEREx data around (ra, dec)."""
+    if dataset:
+        try:
+            return jobs.get_or_start_dataset(dataset, ra, dec)
+        except UploadError as e:
+            raise HTTPException(400, str(e))
+    if ra is None or dec is None:
+        raise HTTPException(400, "ra and dec are required (or a dataset id)")
+    return _job(ra, dec, fov, dets, release, deep, refresh)
 
 
 def _crop(job: jobs.Job, fov: float) -> tuple[int, int]:
     """(n, offset) of the requested field inside the job grid; both sizes are odd, so it stays centred."""
     if not job.n:
         return 0, 0
-    n = min(make_grid(job.ra, job.dec, _fov(fov))[1], job.n)
+    n = min(make_grid(job.ra, job.dec, _fov(fov), job.pixel_scale)[1], job.n)
     return n, (job.n - n) // 2
 
 
@@ -56,7 +79,7 @@ def _cut(img, n: int, off: int):
 
 def _cached_response(body: dict, complete: bool) -> JSONResponse:
     # The Cloudflare Worker stores responses in R2 only when X-Complete is true.
-    headers = {"X-Complete": "true" if complete else "false",
+    headers = {"X-Complete": "true" if complete else "false", "X-Backend-Gen": config.BACKEND_GEN,
                "Cache-Control": "public, max-age=86400" if complete else "no-store"}
     return JSONResponse(body, headers=headers)
 
@@ -112,15 +135,19 @@ def resolve(q: str = Query(..., min_length=1, max_length=200)):
 
 @app.get("/api/frames")
 def frames(
-    ra: float = Query(..., ge=0, le=360),
-    dec: float = Query(..., ge=-90, le=90),
+    ra: float | None = Query(None, ge=0, le=360),
+    dec: float | None = Query(None, ge=-90, le=90),
     fov: float = Query(0.1, description="field of view, degrees"),
     dets: str = Query("5,6", description="SPHEREx detectors 1-6, comma separated"),
-    mode: str = Query("epoch", pattern="^(epoch|exposure)$"),
+    mode: str = Query("epoch", pattern="^(epoch|exposure|wavelength)$"),
     wl_min: float | None = Query(None, description="micron"),
     wl_max: float | None = Query(None, description="micron"),
+    release: str = RELEASE_Q,
+    deep: bool = DEEP_Q,
+    refresh: bool = Query(False, description="search the archive again for new exposures (at most hourly)"),
+    dataset: str | None = DATASET_Q,
 ):
-    job = _job(ra, dec, fov, dets)
+    job = _view_job(ra, dec, fov, dets, release, deep, dataset, refresh)
     n, off = _crop(job, fov)
     complete = job.status == "done"
     body = {
@@ -129,8 +156,11 @@ def frames(
         "error": job.error,
         "progress": {"done": len(job.metas), "total": job.total, "failed": job.failed},
         "grid": {"n": n, "ra": job.ra, "dec": job.dec, "fov": _fov(fov),
-                 "pixel_scale_arcsec": config.PIXEL_SCALE_ARCSEC},
+                 "pixel_scale_arcsec": job.pixel_scale},
         "detectors": job.detectors,
+        "collections": job.collections,
+        "dataset": job.info if job.dataset else None,
+        "refresh_wait_s": round(job.refresh_wait) if refresh else 0,
         "epochs": job.epochs,
         "mode": mode,
         "frames": [],
@@ -140,28 +170,62 @@ def frames(
             for f in jobs.epoch_frames(job, wl_min, wl_max):
                 img = f.pop("image")
                 body["frames"].append({**f, "image": _b64(_cut(img, n, off))})
+        elif mode == "wavelength":
+            for f in jobs.wavelength_frames(job):
+                img = f.pop("image")
+                body["frames"].append({**f, "image": _b64(_cut(img, n, off))})
         else:
             for f in jobs.exposure_frames(job, wl_min, wl_max):
                 body["frames"].append({"meta": f["meta"], "image": _b64(_cut(f["image"], n, off))})
-    return _cached_response(body, complete)
+    # A refresh request is never cached; the Worker clears this view's stored results instead.
+    return _cached_response(body, complete and not refresh)
+
+
+@app.get("/api/releases")
+def releases():
+    """Releases found in the public S3 bucket (newest first) and what 'auto' currently means."""
+    avail = available_releases()
+    return {"available": avail, "auto": pick_releases(avail), "auto_collections": resolve_collections("auto", False)}
+
+
+@app.get("/api/exposures")
+def exposures(
+    ra: float | None = Query(None, ge=0, le=360),
+    dec: float | None = Query(None, ge=-90, le=90),
+    fov: float = Query(0.1),
+    dets: str = Query("5,6"),
+    release: str = RELEASE_Q,
+    deep: bool = DEEP_Q,
+    dataset: str | None = DATASET_Q,
+):
+    """Per-exposure metadata (date, detector, wavelength, flags at the target...) without pixels."""
+    job = _view_job(ra, dec, fov, dets, release, deep, dataset)
+    rows = jobs.exposure_list(job) if job.status in ("fetching", "done") else []
+    return _cached_response({"status": job.status, "error": job.error, "epochs": job.epochs, "exposures": rows},
+                            job.status == "done")
 
 
 @app.get("/api/photometry")
 def photometry(
-    ra: float = Query(..., ge=0, le=360),
-    dec: float = Query(..., ge=-90, le=90),
+    ra: float | None = Query(None, ge=0, le=360),
+    dec: float | None = Query(None, ge=-90, le=90),
     fov: float = Query(0.1),
     dets: str = Query("5,6"),
     x: float = Query(..., description="grid pixel x (0-based)"),
     y: float = Query(..., description="grid pixel y (0-based)"),
     r: float = Query(2.0, gt=0, le=10),
+    release: str = RELEASE_Q,
+    deep: bool = DEEP_Q,
+    dataset: str | None = DATASET_Q,
 ):
-    job = _job(ra, dec, fov, dets)
+    job = _view_job(ra, dec, fov, dets, release, deep, dataset)
     if job.status not in ("fetching", "done"):
         return _cached_response({"status": job.status, "error": job.error, "points": []}, False)
     _, off = _crop(job, fov)  # x, y are in the (cropped) grid the client sees
     pts, phot_mode = jobs.photometry(job, x + off, y + off, r_ap=r, r_in=r * 2, r_out=r * 3.5)
-    return _cached_response({"status": job.status, "mode": phot_mode, "points": pts}, job.status == "done")
+    unit = job.units if job.dataset else "mJy"
+    return _cached_response({"status": job.status, "mode": phot_mode, "unit": unit, "points": pts},
+                            job.status == "done")
 
 
 @app.get("/api/gaia")

@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import {
-  fetchFrames, fetchGaia, fetchPhotometry, resolveTarget,
-  type FramesResult, type GaiaSource, type PhotPoint, type Resolved, type ViewParams,
+  fetchFrames, fetchGaia, fetchPhotometry, fetchReleases, resolveTarget,
+  type Frame, type FramesResult, type GaiaSource, type PhotPoint, type Releases, type Resolved, type ViewMode, type ViewParams,
 } from './api'
 import { PhotometryCharts } from './components/Charts'
-import { Reference, type RefSource } from './components/Reference'
+import { ExposureTable } from './components/ExposureTable'
+import { REF_SOURCES, Reference, type RefSource } from './components/Reference'
+import { UploadPanel } from './components/UploadPanel'
 import { Viewer } from './components/Viewer'
 import type { StretchOpts } from './render'
-import { formatDec, formatRA, pixelToSky } from './sky'
+import { formatDec, formatRA, pixelToSky, skyToPixel } from './sky'
 
 const TARGETS = [
   { label: "Barnard's Star", q: "Barnard's Star", hint: 'high proper motion', fov: 0.1 },
@@ -30,9 +32,14 @@ function readURL(): { params: ViewParams | null; q: string | null; speed: number
   const ra = parseFloat(u.get('ra') ?? ''), dec = parseFloat(u.get('dec') ?? '')
   const dets = (u.get('dets') ?? '5,6').split(',').map(Number).filter((d) => d >= 1 && d <= 6)
   const speed = parseInt(u.get('speed') ?? '500', 10) || 500
-  const mode = u.get('mode') === 'exposure' ? 'exposure' : 'epoch'
+  const m = u.get('mode')
+  const mode: ViewMode = m === 'exposure' || m === 'wavelength' ? m : 'epoch'
   const fov = Math.min(0.25, Math.max(0.02, parseFloat(u.get('fov') ?? '0.1') || 0.1))
-  if (Number.isFinite(ra) && Number.isFinite(dec)) return { params: { ra, dec, fov, dets, mode }, q: u.get('q'), speed }
+  const release = /^(auto|(dr|qr)\d+)$/.test(u.get('release') ?? '') ? u.get('release')! : 'auto'
+  const deep = u.get('deep') !== '0' // Deep Fields included unless a link says deep=0
+  const dataset = /^[0-9a-f]{32}$/.test(u.get('dataset') ?? '') ? u.get('dataset')! : undefined
+  if (dataset) return { params: { ra, dec, fov, dets, mode, release, deep, dataset }, q: null, speed }
+  if (Number.isFinite(ra) && Number.isFinite(dec)) return { params: { ra, dec, fov, dets, mode, release, deep }, q: u.get('q'), speed }
   return { params: null, q: u.get('q'), speed }
 }
 
@@ -48,9 +55,31 @@ export default function App() {
     const t = setTimeout(() => setFov(fovDraft), 350)
     return () => clearTimeout(t)
   }, [fovDraft])
-  const [refSource, setRefSource] = useState<RefSource>('unwise')
+  const [refSource, setRefSource] = useState<RefSource>(() => {
+    const r = new URLSearchParams(location.search).get('ref')
+    return REF_SOURCES.some((s) => s.id === r) ? (r as RefSource) : 'unwise'
+  })
   const [dets, setDets] = useState<number[]>(init.params?.dets ?? [5, 6])
-  const [mode, setMode] = useState<'epoch' | 'exposure'>(init.params?.mode ?? 'epoch')
+  const [mode, setMode] = useState<ViewMode>(init.params?.mode ?? 'epoch')
+  // Which SPHEREx data: 'auto' (newest data + quick release) or one release; optionally Deep Fields.
+  const [release, setRelease] = useState(() => {
+    const r = new URLSearchParams(location.search).get('release') ?? 'auto'
+    return /^(auto|(dr|qr)\d+)$/.test(r) ? r : 'auto'
+  })
+  const [deep, setDeep] = useState(() => new URLSearchParams(location.search).get('deep') !== '0')
+  const [releases, setReleases] = useState<Releases | null>(null)
+  useEffect(() => { fetchReleases().then(setReleases).catch(() => setReleases(null)) }, [])
+  // "Check for new data": the next frames request asks the backend to search the archive again.
+  const refreshNext = useRef(false)
+  const refreshFrom = useRef<number | null>(null) // exposure count before the check
+  const [refreshTick, setRefreshTick] = useState(0)
+  const [refreshNote, setRefreshNote] = useState<string | null>(null)
+  // ?embed=1: just the viewer and a minimal bar, for <iframe> embedding on other sites.
+  const embed = useMemo(() => new URLSearchParams(location.search).get('embed') === '1', [])
+  // Images | Difference (each frame minus the mean) | A minus B (two chosen frames).
+  const [imageType, setImageType] = useState<'frames' | 'difference' | 'ab'>('frames')
+  const [abA, setAbA] = useState(-1)
+  const [abB, setAbB] = useState(0)
   const [result, setResult] = useState<FramesResult | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -63,9 +92,21 @@ export default function App() {
   const [showGaia, setShowGaia] = useState(true)
   const [skipShallow, setSkipShallow] = useState(true)
   const [photMode, setPhotMode] = useState<'aperture' | 'wing'>('aperture')
+  const [photUnit, setPhotUnit] = useState('mJy')
+  const [showUpload, setShowUpload] = useState(false)
   const [gaia, setGaia] = useState<GaiaSource[] | null>(null)
   const [pick, setPick] = useState<[number, number] | null>(null)
+  const pendingSrc = useRef<[number, number] | null>((() => {
+    const v = (new URLSearchParams(location.search).get('src') ?? '').split(',').map(Number)
+    return v.length === 2 && v.every(Number.isFinite) ? [v[0], v[1]] : null
+  })())
   const [phot, setPhot] = useState<PhotPoint[] | null>(null)
+  // Clicked source in sky coordinates (for the shareable ?src= link).
+  const pickSky = useMemo(() => {
+    const g = result?.grid
+    if (!pick || !g?.n) return null
+    return pixelToSky({ n: g.n, ra: g.ra, dec: g.dec, scaleDeg: g.pixel_scale_arcsec / 3600 }, pick[0], pick[1])
+  }, [pick, result?.grid])
   const [hover, setHover] = useState<[number, number] | null>(null)
 
   // ---- search
@@ -79,13 +120,13 @@ export default function App() {
       const f = fovOverride ?? fov
       setFov(f)
       setFovDraft(f)
-      setParams({ ra: r.ra, dec: r.dec, fov: f, dets, mode })
+      setParams({ ra: r.ra, dec: r.dec, fov: f, dets, mode, release, deep, dataset: undefined })
     } catch (e) {
       setError((e as Error).message)
     } finally {
       setBusy(false)
     }
-  }, [fov, dets, mode])
+  }, [fov, dets, mode, release, deep])
 
   useEffect(() => {
     if (!init.params && init.q) go(init.q)
@@ -93,19 +134,27 @@ export default function App() {
 
   // Settings changes re-run the view without re-resolving.
   useEffect(() => {
-    setParams((p) => (p ? { ...p, fov, dets, mode } : p))
-  }, [fov, dets, mode])
+    setParams((p) => (p ? { ...p, fov, dets, mode, release, deep } : p))
+    setRefreshNote(null)
+  }, [fov, dets, mode, release, deep])
 
   // ---- URL sync (shareable links)
   useEffect(() => {
     if (!params) return
-    const u = new URLSearchParams({
-      ra: params.ra.toFixed(6), dec: params.dec.toFixed(6), fov: params.fov.toFixed(3),
-      dets: params.dets.join(','), mode: params.mode, speed: String(speed),
-    })
-    if (query) u.set('q', query)
+    const u = new URLSearchParams({ fov: params.fov.toFixed(3), mode: params.mode, speed: String(speed), ref: refSource })
+    if (Number.isFinite(params.ra) && Number.isFinite(params.dec)) {
+      u.set('ra', params.ra.toFixed(6))
+      u.set('dec', params.dec.toFixed(6))
+    }
+    if (params.dataset) u.set('dataset', params.dataset)
+    else u.set('dets', params.dets.join(','))
+    if (query && !params.dataset) u.set('q', query)
+    if (params.release !== 'auto') u.set('release', params.release)
+    if (!params.deep) u.set('deep', '0')
+    if (embed) u.set('embed', '1')
+    if (pickSky) u.set('src', `${pickSky[0].toFixed(6)},${pickSky[1].toFixed(6)}`)
     history.replaceState(null, '', `?${u}`)
-  }, [params, speed, query])
+  }, [params, speed, query, refSource, pickSky, embed])
 
   // ---- frames, polled until the backend job finishes
   const pollRef = useRef(0)
@@ -117,18 +166,31 @@ export default function App() {
     // Same target and settings with only a new field of view: keep showing the current frames
     // until the re-cropped ones arrive (the backend serves them from the same job).
     const prev = prevParams.current
-    const sameView = !!prev && prev.ra === params.ra && prev.dec === params.dec && prev.mode === params.mode
-      && prev.dets.join() === params.dets.join()
+    // Object.is: an upload without a chosen target has NaN coordinates (NaN !== NaN).
+    const sameView = !!prev && Object.is(prev.ra, params.ra) && Object.is(prev.dec, params.dec) && prev.mode === params.mode && prev.dataset === params.dataset
+      && prev.dets.join() === params.dets.join() && prev.release === params.release && prev.deep === params.deep
+    let refresh = refreshNext.current
+    refreshNext.current = false
     prevParams.current = params
     if (!sameView) { setResult(null); setIndex(0) }
     setPick(null); setPhot(null)
     let failures = 0
     const tick = async () => {
       try {
-        const r = await fetchFrames(params, ctrl.signal)
+        const r = await fetchFrames(params, ctrl.signal, refresh)
         if (myPoll !== pollRef.current) return
+        if (refresh && r.refresh_wait_s > 0) {
+          refreshFrom.current = null
+          setRefreshNote(`Checked less than an hour ago. You can check again in ${Math.ceil(r.refresh_wait_s / 60)} min.`)
+        }
+        refresh = false
         failures = 0
         setResult(r)
+        if (r.status === 'done' && refreshFrom.current != null) {
+          const added = r.progress.total - refreshFrom.current
+          setRefreshNote(added > 0 ? `Found ${added} new exposure${added === 1 ? '' : 's'}.` : `Up to date: no new exposures (${r.progress.total} in total).`)
+          refreshFrom.current = null
+        }
         if (r.status === 'error') { setError(r.error); return }
         if (r.status !== 'done') setTimeout(tick, r.frames.length ? 2000 : 1000)
       } catch (e) {
@@ -141,27 +203,49 @@ export default function App() {
     setError(null)
     tick()
     return () => ctrl.abort()
-  }, [params])
+  }, [params, refreshTick])
 
   // ---- Gaia overlay
+  const gRa = params?.dataset ? result?.grid.ra : params?.ra
+  const gDec = params?.dataset ? result?.grid.dec : params?.dec
   useEffect(() => {
-    if (!params || !showGaia) return
+    if (!params || !showGaia || gRa == null || gDec == null || !Number.isFinite(gRa) || !result?.grid.n && params.dataset) return
     let live = true
-    fetchGaia(params.ra, params.dec, params.fov * 0.75)
+    fetchGaia(gRa, gDec, params.fov * 0.75)
       .then((g) => live && setGaia(g.sources))
       .catch(() => live && setGaia(null))
     return () => { live = false }
-  }, [params, showGaia])
+  }, [params, showGaia, gRa, gDec]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---- frames actually shown (shallow epochs are noisy and patchy)
   const frames = useMemo(
     () => (result?.frames ?? []).filter((f) => !(skipShallow && f.shallow) && f.data),
     [result, skipShallow],
   )
-  useEffect(() => { setIndex((i) => (frames.length ? i % frames.length : 0)) }, [frames.length])
+  // Epochs hidden by "Skip shallow epochs", named under the frame buttons so nothing disappears silently.
+  const hiddenShallow = useMemo(
+    () => (skipShallow && mode === 'epoch' ? (result?.frames ?? []).filter((f) => f.shallow && f.data) : []),
+    [result, skipShallow, mode],
+  )
+  // A minus B: indices into the shown frames (A defaults to the last, B to the first).
+  const aIdx = frames.length ? (abA < 0 || abA >= frames.length ? frames.length - 1 : abA) : 0
+  const bIdx = frames.length ? Math.min(abB, frames.length - 1) : 0
+  const abActive = imageType === 'ab' && frames.length >= 2
+  const viewFrames: Frame[] = useMemo(() => {
+    if (!abActive) return frames
+    const A = frames[aIdx], B = frames[bIdx]
+    const data = A.data && B.data ? A.data.map((v, i) => v - B.data![i]) : null
+    return [{ ...A, label: `${A.label} − ${B.label}`, date: `${A.date} minus ${B.date}`, data, meta: undefined }]
+  }, [abActive, frames, aIdx, bIdx])
+  // Memoised: the viewer re-renders every frame bitmap when this object changes.
+  const viewStretch: StretchOpts = useMemo(
+    () => ({ ...stretch, display: abActive ? 'signed' : imageType === 'difference' ? 'difference' : 'frames' }),
+    [stretch, abActive, imageType],
+  )
+  useEffect(() => { setIndex((i) => (viewFrames.length ? i % viewFrames.length : 0)) }, [viewFrames.length])
 
   // ---- blink loop
-  const nFrames = frames.length
+  const nFrames = viewFrames.length
   useEffect(() => {
     if (!playing || nFrames < 2) return
     const t = setInterval(() => setIndex((i) => (i + 1) % nFrames), speed)
@@ -188,6 +272,7 @@ export default function App() {
       const r = await fetchPhotometry(params, x, y)
       setPhot(r.points)
       setPhotMode(r.mode)
+      setPhotUnit(r.unit ?? 'mJy')
     } catch (e) {
       setError((e as Error).message)
     }
@@ -195,18 +280,48 @@ export default function App() {
 
   const grid = result?.grid
   const geom = grid?.n ? { n: grid.n, ra: grid.ra, dec: grid.dec, scaleDeg: grid.pixel_scale_arcsec / 3600 } : null
+
+  // ?src=RA,Dec reopens a clicked source (its spectrum and brightness) once the frames are ready.
+  useEffect(() => {
+    if (!pendingSrc.current || result?.status !== 'done' || !geom) return
+    const p = skyToPixel(geom, pendingSrc.current[0], pendingSrc.current[1])
+    pendingSrc.current = null
+    if (p && p[0] >= 0 && p[1] >= 0 && p[0] < geom.n && p[1] < geom.n) onPick(p[0], p[1])
+  }, [result?.status, geom?.n]) // eslint-disable-line react-hooks/exhaustive-deps
   const hoverSky = geom && hover ? pixelToSky(geom, hover[0], hover[1]) : null
-  const frame = frames[index]
+  const frame = viewFrames[index]
   const progress = result?.progress
   // A view is set but its first response hasn't arrived yet also counts as loading.
   const running = !!params && !error && (!result || (result.status !== 'done' && result.status !== 'error'))
+
+  if (embed) {
+    const full = new URLSearchParams(location.search)
+    full.delete('embed')
+    return (
+      <div className="embed">
+        {grid?.n ? (
+          <Viewer grid={grid} frames={viewFrames} index={index} stretch={viewStretch} smooth={smooth}
+            gaia={showGaia ? gaia : null} gaiaEpoch={2016.0} pick={null} onPick={() => {}} onHover={setHover} />
+        ) : (
+          <div className="placeholder embed-placeholder">
+            <p>{error ?? (<><span className="spinner" aria-hidden="true" />Loading SPHEREx images…</>)}</p>
+          </div>
+        )}
+        <div className="embed-bar">
+          <button onClick={() => setPlaying((p) => !p)} aria-label={playing ? 'Pause' : 'Play'}>{playing ? '❚❚' : '▶'}</button>
+          <span className="embed-frame">{frame ? <><strong>{frame.label}</strong> · {frame.date}</> : 'SPHEREx'}</span>
+          <a href={`${location.pathname}?${full}`} target="_blank" rel="noopener">Open in SPHEREx Sky Motion Explorer ↗</a>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="app">
       <header>
         <div className="title-row">
           <h1>SPHEREx Sky Motion Explorer</h1>
-          <span className="team">by Team Braobax</span>
+          <span className="team">by Team Barobax</span>
         </div>
         <p className="tagline">Blink NASA SPHEREx infrared images of any patch of sky to spot things that move or change.</p>
       </header>
@@ -223,7 +338,21 @@ export default function App() {
         {TARGETS.map((t) => (
           <button key={t.label} className="chip" onClick={() => go(t.q, t.fov)} title={t.hint}>{t.label}</button>
         ))}
+        <button className="chip chip-upload" onClick={() => setShowUpload((v) => !v)} aria-expanded={showUpload}>
+          Upload your own FITS images
+        </button>
       </div>
+      {showUpload && (
+        <UploadPanel onClose={() => setShowUpload(false)} onDone={(id, t) => {
+          setShowUpload(false)
+          setResolved(null)
+          setQuery('')
+          setFov(0.25)
+          setFovDraft(0.25)
+          setMode('epoch')
+          setParams({ ra: t ? t[0] : NaN, dec: t ? t[1] : NaN, fov: 0.25, dets, mode: 'epoch', release, deep, dataset: id })
+        }} />
+      )}
 
       {error && <div className="error" role="alert">{error}</div>}
 
@@ -232,12 +361,38 @@ export default function App() {
           {grid?.n ? (
             <div className="panes">
               <div className="pane">
-              <Viewer grid={grid} frames={frames} index={index} stretch={stretch} smooth={smooth}
+              <Viewer grid={grid} frames={viewFrames} index={index} stretch={viewStretch} smooth={smooth}
                 gaia={showGaia ? gaia : null} gaiaEpoch={2016.0} pick={pick} onPick={onPick} onHover={setHover} />
+              {/* What the markers on the image mean; entries appear only when that marker is shown. */}
+              <div className="viewer-legend" aria-label="Image markers">
+                <span className="vl-item">
+                  <svg width="18" height="18" aria-hidden="true"><path d="M9 1V5M9 13V17M1 9H5M13 9H17" stroke="#ffc400" strokeWidth="2" /></svg>
+                  Target
+                </span>
+                {showGaia && gaia && (
+                  <>
+                    <span className="vl-item">
+                      <svg width="18" height="18" aria-hidden="true"><circle cx="9" cy="9" r="6" fill="none" stroke="rgb(80,200,255)" strokeWidth="1.6" /></svg>
+                      Gaia DR3 star, moved to this frame's date
+                    </span>
+                    <span className="vl-item">
+                      <svg width="18" height="18" aria-hidden="true"><circle cx="9" cy="9" r="7.5" fill="none" stroke="rgb(255,92,92)" strokeWidth="1.8" /></svg>
+                      Fast-moving Gaia star (over 0.2″ per year)
+                    </span>
+                  </>
+                )}
+                {pick && (
+                  <span className="vl-item">
+                    <svg width="18" height="18" aria-hidden="true"><circle cx="9" cy="9" r="7" fill="none" stroke="rgb(0,255,140)" strokeWidth="1.8" /></svg>
+                    Source you clicked (photometry aperture)
+                  </span>
+                )}
+              </div>
               <div className="frame-info">
                 <strong>{frame?.label}</strong> · {frame?.date}
                 {frame?.wavelength && ` · ${frame.wavelength[0].toFixed(2)}${frame.wavelength[1] !== frame.wavelength[0] ? `–${frame.wavelength[1].toFixed(2)}` : ''} µm`}
-                {mode === 'epoch' && frame && ` · ${frame.nUsed} exposures`}
+                {mode === 'epoch' && frame && !abActive && ` · ${frame.nUsed} exposures`}
+                {mode === 'wavelength' && frame?.channel && !abActive && ` · ${frame.nUsed} exposures from ${frame.channel.nEpochs} epochs`}
                 {frame && frame.nContaminated > 0 && <span className="warn"> · {frame.nContaminated} flagged</span>}
                 {frame?.meta?.target_flags.length ? <span className="muted"> · flags: {frame.meta.target_flags.join(', ')}</span> : null}
               </div>
@@ -251,20 +406,27 @@ export default function App() {
                 </div>
               )}
 
-              {frames.length > 0 && (
+              {frames.length > 0 && !abActive && (
                 <div className="strip">
                   {frames.map((f, i) => (
                     <button key={i} className={`thumb ${i === index ? 'active' : ''}`} onClick={() => { setPlaying(false); setIndex(i) }}>
-                      <span>{mode === 'epoch' ? f.label.replace('Epoch ', 'E') : i + 1}</span>
-                      <small>{f.date.slice(0, 10)}</small>
+                      <span>{mode === 'epoch' ? f.label.replace('Epoch ', 'E') : mode === 'wavelength' ? f.label.replace(' µm', '') : i + 1}</span>
+                      <small>{mode === 'wavelength' && f.channel ? `D${f.channel.detector}·${f.channel.channel}` : f.date.slice(0, 10)}</small>
                     </button>
                   ))}
                 </div>
               )}
+              {hiddenShallow.length > 0 && !abActive && (
+                <p className="muted small hidden-note">
+                  {hiddenShallow.map((f) => f.label.replace('Epoch ', 'E')).join(', ')} hidden: too few exposures
+                  ({hiddenShallow.map((f) => f.nUsed).join(' and ')}).{' '}
+                  <button className="link" onClick={() => setSkipShallow(false)}>Show {hiddenShallow.length === 1 ? 'it' : 'them'}</button>
+                </p>
+              )}
               </div>
               <div className="pane">
                 <Reference grid={grid} source={refSource} onSource={setRefSource}
-                  frames={frames.map((f) => f.data)} stretch={stretch} />
+                  frames={frames.map((f) => f.data)} stretch={stretch} gaia={gaia} />
               </div>
             </div>
           ) : (
@@ -287,7 +449,26 @@ export default function App() {
         </section>
 
         <aside className="controls">
-          {resolved && params && (
+          {params?.dataset && (
+            <div className="target">
+              <div className="target-name">Your uploaded dataset</div>
+              {result?.dataset ? (
+                <>
+                  <div className="small">
+                    {result.dataset.files_used} file{result.dataset.files_used === 1 ? '' : 's'} used · {result.dataset.pixel_scale_arcsec.toFixed(2)}″ pixels · units: {result.dataset.units}
+                  </div>
+                  {result.dataset.rejected.length > 0 && (
+                    <details className="small"><summary className="warn">{result.dataset.rejected.length} file{result.dataset.rejected.length === 1 ? '' : 's'} skipped</summary>
+                      <ul className="rejected">{result.dataset.rejected.map((r) => <li key={r.name}><span className="mono">{r.name}</span>: {r.reason}</li>)}</ul>
+                    </details>
+                  )}
+                </>
+              ) : <div className="muted small">{result?.status === 'error' ? 'Could not use these files.' : 'Checking your files…'}</div>}
+              {grid?.n ? <div className="mono small">{formatRA(grid.ra)} {formatDec(grid.dec)}</div> : null}
+              <div className="muted small">Private link, deleted automatically after 7 days.</div>
+            </div>
+          )}
+          {resolved && params && !params.dataset && (
             <div className="target">
               <div className="target-name">{resolved.name ?? 'Coordinates'}{resolved.otype ? <span className="muted"> · {resolved.otype}</span> : null}</div>
               <div className="mono">{formatRA(params.ra)} {formatDec(params.dec)}</div>
@@ -300,22 +481,47 @@ export default function App() {
             <div className="seg" role="group" aria-label="Frames to animate">
               <button aria-pressed={mode === 'epoch'} className={mode === 'epoch' ? 'on' : ''} onClick={() => setMode('epoch')}>Epochs</button>
               <button aria-pressed={mode === 'exposure'} className={mode === 'exposure' ? 'on' : ''} onClick={() => setMode('exposure')}>Exposures</button>
+              <button aria-pressed={mode === 'wavelength'} className={mode === 'wavelength' ? 'on' : ''} onClick={() => setMode('wavelength')}>Wavelength</button>
             </div>
             <p className="muted small seg-hint">
-              {mode === 'epoch'
-                ? 'One stacked image per survey visit: best for stars and brown dwarfs.'
-                : 'Every exposure in time order: best for asteroids and comets.'}
+              {params?.dataset
+                ? (mode === 'wavelength' ? 'One stack per wavelength or filter found in your files.' : 'Each uploaded file is one frame, in time order.')
+                : mode === 'epoch'
+                ? 'Each epoch is one SPHEREx visit (about every 6 months): exposures less than 20 days apart, stacked and weighted by noise. Visits longer than 30 days are split.'
+                : mode === 'exposure'
+                  ? 'Every exposure in time order: best for asteroids and comets.'
+                  : 'Steps through the spectrum: one stack per SPHEREx channel (17 per detector, 102 in all), all epochs combined. Sources with strong features fade in and out.'}
             </p>
             <div className="seg" role="group" aria-label="Image type">
-              <button aria-pressed={stretch.display === 'frames'} className={stretch.display === 'frames' ? 'on' : ''}
-                onClick={() => setStretch({ ...stretch, display: 'frames' })}>Images</button>
-              <button aria-pressed={stretch.display === 'difference'} className={stretch.display === 'difference' ? 'on' : ''}
-                onClick={() => setStretch({ ...stretch, display: 'difference' })}>Difference</button>
+              <button aria-pressed={imageType === 'frames'} className={imageType === 'frames' ? 'on' : ''} onClick={() => setImageType('frames')}>Images</button>
+              <button aria-pressed={imageType === 'difference'} className={imageType === 'difference' ? 'on' : ''} onClick={() => setImageType('difference')}>Difference</button>
+              <button aria-pressed={imageType === 'ab'} className={imageType === 'ab' ? 'on' : ''} onClick={() => setImageType('ab')}>A − B</button>
             </div>
+            {imageType === 'ab' && frames.length >= 2 && (
+              <div className="ab-pick">
+                <label>A
+                  <select value={aIdx} onChange={(e) => setAbA(+e.target.value)}>
+                    {frames.map((f, i) => <option key={i} value={i}>{f.label} · {f.date.slice(0, 16)}</option>)}
+                  </select>
+                </label>
+                <span className="ab-minus" aria-hidden="true">−</span>
+                <label>B
+                  <select value={bIdx} onChange={(e) => setAbB(+e.target.value)}>
+                    {frames.map((f, i) => <option key={i} value={i}>{f.label} · {f.date.slice(0, 16)}</option>)}
+                  </select>
+                </label>
+              </div>
+            )}
             <p className="muted small seg-hint">
-              {stretch.display === 'frames'
+              {imageType === 'frames'
                 ? 'The images as observed.'
-                : 'Each frame minus the average: still stars vanish, movers show as dark/light pairs.'}
+                : imageType === 'difference'
+                  ? 'Each frame minus the average: still stars vanish, movers show as dark/light pairs.'
+                  : frames.length < 2
+                    ? 'Needs at least two frames.'
+                    : mode === 'wavelength'
+                      ? 'One channel minus another: a colour image. Sources brighter at A than at B stay light, the rest go dark.'
+                      : 'Frame A minus frame B: what changed between the two. A mover shows as a light/dark pair.'}
             </p>
           </fieldset>
 
@@ -331,7 +537,7 @@ export default function App() {
             </label>
           </fieldset>
 
-          <fieldset>
+          {!params?.dataset && <fieldset>
             <legend>Wavelength (detectors)</legend>
             <div className="dets">
               {DETECTORS.map(({ d, range }) => (
@@ -346,7 +552,27 @@ export default function App() {
               ))}
             </div>
             <p className="muted small">Brown dwarfs are brightest in D5–D6. Fewer detectors load faster.</p>
-          </fieldset>
+          </fieldset>}
+
+          {!params?.dataset && <fieldset>
+            <legend>Data</legend>
+            <label>Data release
+              <select value={release} onChange={(e) => setRelease(e.target.value)}>
+                <option value="auto">Newest{releases?.auto.length ? ` (${releases.auto.map((r) => r.toUpperCase()).join(' + ')})` : ''}</option>
+                {(releases?.available ?? []).map((r) => <option key={r} value={r}>{r.toUpperCase()}</option>)}
+              </select>
+            </label>
+            <label className="check"><input type="checkbox" checked={deep} onChange={(e) => setDeep(e.target.checked)} /> Include Deep Fields <small className="muted">(extra visits near the ecliptic poles)</small></label>
+            <button disabled={!params || !result || result.status !== 'done'} onClick={() => {
+              refreshNext.current = true
+              refreshFrom.current = result?.progress.total ?? null
+              setRefreshNote('Searching the archive for new exposures…')
+              setRefreshTick((t) => t + 1)
+            }}>Check for new data</button>
+            <p className="muted small" aria-live="polite">
+              {refreshNote ?? 'New releases appear in the list automatically. "Newest" uses the latest data and quick release.'}
+            </p>
+          </fieldset>}
 
           <fieldset>
             <legend>Field of view</legend>
@@ -372,8 +598,15 @@ export default function App() {
       {pick && (
         <section className="photometry">
           <h2>Source at {geom ? (() => { const s = pixelToSky(geom, pick[0], pick[1]); return `${formatRA(s[0])} ${formatDec(s[1])}` })() : ''}</h2>
-          {phot ? <PhotometryCharts points={phot} mode={photMode} epochDates={result?.epochs.map((e) => e.date_mid) ?? []} /> : <p className="muted">Measuring…</p>}
+          {phot ? <PhotometryCharts points={phot} mode={photMode} unit={photUnit}
+            hiddenEpochs={skipShallow && mode === 'epoch' ? (result?.frames ?? []).flatMap((f, i) => (f.shallow ? [i] : [])) : []}
+            epochDates={result?.epochs.map((e) => e.date_mid) ?? []} /> : <p className="muted">Measuring…</p>}
         </section>
+      )}
+
+      {params && result && result.frames.length > 0 && (
+        <ExposureTable params={params} ready={result.status === 'done'}
+          currentKey={mode === 'exposure' && frame?.meta ? `${frame.meta.obsid}D${frame.meta.detector}` : undefined} />
       )}
 
       {result?.status === 'done' && result.frames.length === 0 && (

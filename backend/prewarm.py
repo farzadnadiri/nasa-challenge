@@ -20,7 +20,9 @@ TARGETS = [  # (query, fov deg, detectors) matching the frontend presets
 
 def warm(client: httpx.Client, q: str, fov: float, dets: str):
     r = client.get(f"{BASE}/api/resolve", params={"q": q}).json()
-    params = {"ra": f"{r['ra']:.6f}", "dec": f"{r['dec']:.6f}", "fov": f"{fov:.3f}", "dets": dets}
+    # Same query string the page sends (release and deep included), so the R2 cache keys match.
+    params = {"ra": f"{r['ra']:.6f}", "dec": f"{r['dec']:.6f}", "fov": f"{fov:.3f}", "dets": dets,
+              "release": "auto", "deep": "1"}
     t0 = time.time()
     while True:
         try:
@@ -36,8 +38,12 @@ def warm(client: httpx.Client, q: str, fov: float, dets: str):
             print(f"  {d.get('error') or ''}")
             break
         time.sleep(5)
-    if d["status"] == "done":  # also cache the exposure-mode response in R2 when going through the Worker
-        client.get(f"{BASE}/api/frames", params={**params, "mode": "exposure"})
+    if d["status"] == "done":  # also cache the other views in R2 when going through the Worker
+        for mode in ("exposure", "wavelength"):
+            client.get(f"{BASE}/api/frames", params={**params, "mode": mode})
+        client.get(f"{BASE}/api/exposures", params=params)
+        # Same radius the page asks for (0.75 x field of view), so the R2 cache key matches.
+        client.get(f"{BASE}/api/gaia", params={"ra": params["ra"], "dec": params["dec"], "radius": f"{fov * 0.75:.4f}"})
 
 
 if __name__ == "__main__":

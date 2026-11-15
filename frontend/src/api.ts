@@ -19,7 +19,7 @@ export interface ExposureMeta {
   date_obs: string
   wavelength_um: number | null
   bandwidth_um: number | null
-  psf_fwhm_arcsec: number
+  psf_fwhm_arcsec: number | null
   version: string
   release: string
   target_on_image: boolean
@@ -37,6 +37,7 @@ export interface Frame {
   wavelength: [number, number] | null
   nContaminated: number
   meta?: ExposureMeta
+  channel?: { detector: number; channel: number; nEpochs: number }
 }
 
 export interface Grid {
@@ -55,7 +56,41 @@ export interface FramesResult {
   grid: Grid
   epochs: Epoch[]
   frames: Frame[]
+  collections: string[]
+  refresh_wait_s: number
+  dataset: DatasetInfo | null
 }
+
+export interface DatasetInfo {
+  files_used: number
+  rejected: { name: string; reason: string }[]
+  pixel_scale_arcsec: number
+  units: string
+}
+
+// ---- uploads ("FITS + WCS v1")
+export interface UploadLimits { maxFiles: number; maxFileBytes: number; maxDatasetBytes: number; keepDays: number }
+
+export async function createDataset(): Promise<{ id: string; limits: UploadLimits }> {
+  const r = await fetch('/api/datasets', { method: 'POST' })
+  const body = await r.json().catch(() => ({}))
+  if (!r.ok) throw new Error(body.error ?? `${r.status} ${r.statusText}`)
+  return body
+}
+
+export async function uploadFile(id: string, file: File): Promise<void> {
+  const r = await fetch(`/api/datasets/${id}/files/${encodeURIComponent(file.name)}`, { method: 'PUT', body: file })
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}))
+    throw new Error(body.error ?? `${r.status} ${r.statusText}`)
+  }
+}
+
+export interface Releases {
+  available: string[]   // newest first, e.g. ['dr1', 'qr3', 'qr2']
+  auto: string[]        // what 'Newest' currently means, e.g. ['dr1', 'qr3']
+}
+export const fetchReleases = () => getJSON<Releases>('/api/releases')
 
 export interface Resolved {
   query: string
@@ -76,6 +111,9 @@ export interface GaiaSource {
   pmdec: number | null
   parallax: number | null
   phot_g_mean_mag: number | null
+  bp_rp: number | null
+  name?: string   // SIMBAD main identifier, when SIMBAD knows the star
+  otype?: string  // SIMBAD object type code
 }
 
 export interface PhotPoint {
@@ -88,12 +126,17 @@ export interface PhotPoint {
   contaminated: boolean
 }
 
+export type ViewMode = 'epoch' | 'exposure' | 'wavelength'
+
 export interface ViewParams {
   ra: number
   dec: number
   fov: number
   dets: number[]
-  mode: 'epoch' | 'exposure'
+  mode: ViewMode
+  release: string   // 'auto' (newest data + quick release) or a release name such as 'dr1'
+  deep: boolean     // also search the Deep Field collections
+  dataset?: string  // uploaded dataset id; ra/dec may then be NaN (the dataset's own centre)
 }
 
 async function getJSON<T>(url: string, signal?: AbortSignal): Promise<T> {
@@ -118,20 +161,41 @@ function decode(b64: string | null): Float32Array | null {
 }
 
 function qs(p: ViewParams): string {
-  return new URLSearchParams({
-    ra: p.ra.toFixed(6),
-    dec: p.dec.toFixed(6),
-    fov: p.fov.toFixed(3),
-    dets: p.dets.join(','),
-  }).toString()
+  const q = new URLSearchParams({ fov: p.fov.toFixed(3) })
+  if (Number.isFinite(p.ra) && Number.isFinite(p.dec)) {
+    q.set('ra', p.ra.toFixed(6))
+    q.set('dec', p.dec.toFixed(6))
+  }
+  if (p.dataset) {
+    q.set('dataset', p.dataset)
+  } else {
+    q.set('dets', p.dets.join(','))
+    q.set('release', p.release)
+    q.set('deep', p.deep ? '1' : '0')
+  }
+  return q.toString()
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type RawFrame = any
 
-export async function fetchFrames(p: ViewParams, signal?: AbortSignal): Promise<FramesResult> {
-  const raw = await getJSON<RawFrame>(`/api/frames?${qs(p)}&mode=${p.mode}`, signal)
+export async function fetchFrames(p: ViewParams, signal?: AbortSignal, refresh = false): Promise<FramesResult> {
+  const raw = await getJSON<RawFrame>(`/api/frames?${qs(p)}&mode=${p.mode}${refresh ? '&refresh=1' : ''}`, signal)
   const frames: Frame[] = (raw.frames as RawFrame[]).map((f) => {
+    if (p.mode === 'wavelength') {
+      // One stack per SPHEREx channel across all epochs; Gaia markers use the middle of the data.
+      return {
+        label: `${f.wavelength_um.toFixed(3)} µm`,
+        date: `D${f.detector} channel ${f.channel}`,
+        decimalYear: 2026.0,
+        data: decode(f.image),
+        nUsed: f.n_used,
+        shallow: false,
+        wavelength: [f.wavelength_min_um, f.wavelength_max_um],
+        nContaminated: f.n_contaminated ?? 0,
+        channel: { detector: f.detector, channel: f.channel, nEpochs: f.n_epochs },
+      }
+    }
     if (p.mode === 'epoch') {
       const ep: Epoch = f.epoch
       return {
@@ -169,7 +233,15 @@ export const fetchGaia = (ra: number, dec: number, radius: number) =>
     `/api/gaia?ra=${ra.toFixed(6)}&dec=${dec.toFixed(6)}&radius=${radius.toFixed(4)}`,
   )
 
+export interface ExposureRow extends ExposureMeta {
+  saturated: boolean
+  source?: string
+}
+
+export const fetchExposures = (p: ViewParams) =>
+  getJSON<{ status: string; exposures: ExposureRow[] }>(`/api/exposures?${qs(p)}`)
+
 export const fetchPhotometry = (p: ViewParams, x: number, y: number) =>
-  getJSON<{ status: string; mode: 'aperture' | 'wing'; points: PhotPoint[] }>(
+  getJSON<{ status: string; mode: 'aperture' | 'wing'; unit: string; points: PhotPoint[] }>(
     `/api/photometry?${qs(p)}&x=${x.toFixed(2)}&y=${y.toFixed(2)}`,
   )

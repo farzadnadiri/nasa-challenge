@@ -26,9 +26,9 @@ _s3 = httpx.Client(timeout=60, limits=httpx.Limits(max_connections=config.FETCH_
                                                    max_keepalive_connections=config.FETCH_WORKERS * 2))
 
 
-def make_grid(ra: float, dec: float, fov_deg: float) -> tuple[WCS, int]:
-    """North-up, east-left TAN grid at native SPHEREx pixel scale, odd size so the target is central."""
-    scale = config.PIXEL_SCALE_ARCSEC / 3600.0
+def make_grid(ra: float, dec: float, fov_deg: float, scale_arcsec: float = config.PIXEL_SCALE_ARCSEC) -> tuple[WCS, int]:
+    """North-up, east-left TAN grid (native SPHEREx pixels by default), odd size so the target is central."""
+    scale = scale_arcsec / 3600.0
     n = int(np.ceil(fov_deg / scale))
     n += 1 - n % 2
     w = WCS(naxis=2)
@@ -146,6 +146,15 @@ def process_exposure(exp: Exposure, ra: float, dec: float, fov_deg: float,
 
     bad = (flags & _flag_bits(fhdr, config.BAD_FLAG_NAMES)) != 0
     data = img - d["zodi"] if d["zodi"] is not None else img.copy()
+    img_r, var_r = clean_and_reproject(data, d["var"], bad, wcs, grid, n)
+    return {"image": img_r, "variance": var_r, "meta": meta}
+
+
+def clean_and_reproject(data: np.ndarray, var: np.ndarray | None, bad: np.ndarray, wcs: WCS,
+                        grid: WCS, n: int) -> tuple[np.ndarray, np.ndarray]:
+    """Mask bad pixels, remove the local sky level and resample onto the shared grid.
+    Used for SPHEREx exposures and for uploaded files alike."""
+    data = data.astype(np.float32, copy=True)
     data[bad | ~np.isfinite(data)] = np.nan
     # Remove the remaining local sky level (zodiacal light differs between epochs).
     finite = data[np.isfinite(data)]
@@ -153,7 +162,6 @@ def process_exposure(exp: Exposure, ra: float, dec: float, fov_deg: float,
     if finite.size > 10:
         _, med, sky_sigma = sigma_clipped_stats(finite, sigma=3.0, maxiters=5)
         data -= np.float32(med)
-    var = d["var"]
     if var is None:
         # S3 path skips the VARIANCE plane: use the frame's robust sky noise as a uniform
         # variance. Good for weighting the stack; photometry errors on bright stars are optimistic.
@@ -164,4 +172,4 @@ def process_exposure(exp: Exposure, ra: float, dec: float, fov_deg: float,
 
     img_r, _ = reproject_interp((data, wcs), grid, shape_out=(n, n), order="bilinear")
     var_r, _ = reproject_interp((var, wcs), grid, shape_out=(n, n), order="bilinear")
-    return {"image": img_r.astype(np.float32), "variance": var_r.astype(np.float32), "meta": meta}
+    return img_r.astype(np.float32), var_r.astype(np.float32)
