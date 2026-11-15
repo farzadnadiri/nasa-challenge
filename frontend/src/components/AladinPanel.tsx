@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { GaiaSource, Grid } from '../api'
+import { setAladinSnapshot } from '../exportImage'
 import { propagate } from '../sky'
 
 // Interactive sky view with CDS Aladin Lite (loaded on demand: the library is ~2.5 MB).
@@ -71,6 +72,7 @@ export function AladinPanel({ grid, layer, gaia, showGaia, showCatwise }: Props)
           showFrame: false,
           showStatusBar: false,
         })
+        setAladinSnapshot(() => aladinRef.current.getViewDataURL({ format: 'image/png' }))
         setReady(true)
       } catch (e) {
         if (!cancelled) setError(`Aladin Lite could not start: ${(e as Error).message}`)
@@ -78,6 +80,7 @@ export function AladinPanel({ grid, layer, gaia, showGaia, showCatwise }: Props)
     })()
     return () => {
       cancelled = true
+      setAladinSnapshot(null)
       // Aladin has no destroy(); clearing the container releases its canvases.
       if (divRef.current) divRef.current.innerHTML = ''
       aladinRef.current = null

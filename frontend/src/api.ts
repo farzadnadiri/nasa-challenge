@@ -185,13 +185,13 @@ export async function fetchFrames(p: ViewParams, signal?: AbortSignal, refresh =
     if (p.mode === 'wavelength') {
       // One stack per SPHEREx channel across all epochs; Gaia markers use the middle of the data.
       return {
-        label: `${f.wavelength_um.toFixed(3)} µm`,
-        date: `D${f.detector} channel ${f.channel}`,
+        label: f.wavelength_um != null ? `${f.wavelength_um.toFixed(3)} µm` : (f.filter || 'No wavelength'),
+        date: f.detector ? `D${f.detector} channel ${f.channel}` : (f.filter ? `filter ${f.filter}` : 'uploaded files'),
         decimalYear: 2026.0,
         data: decode(f.image),
         nUsed: f.n_used,
         shallow: false,
-        wavelength: [f.wavelength_min_um, f.wavelength_max_um],
+        wavelength: f.wavelength_min_um != null ? [f.wavelength_min_um, f.wavelength_max_um] : null,
         nContaminated: f.n_contaminated ?? 0,
         channel: { detector: f.detector, channel: f.channel, nEpochs: f.n_epochs },
       }

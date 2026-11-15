@@ -10,6 +10,7 @@ import { REF_SOURCES, Reference, type RefSource } from './components/Reference'
 import { UploadPanel } from './components/UploadPanel'
 import { Viewer } from './components/Viewer'
 import type { StretchOpts } from './render'
+import { exportSideBySide } from './exportImage'
 import { formatDec, formatRA, pixelToSky, skyToPixel } from './sky'
 
 const TARGETS = [
@@ -94,6 +95,8 @@ export default function App() {
   const [photMode, setPhotMode] = useState<'aperture' | 'wing'>('aperture')
   const [photUnit, setPhotUnit] = useState('mJy')
   const [showUpload, setShowUpload] = useState(false)
+  // The archive view to return to after looking at an uploaded dataset.
+  const archiveParams = useRef<ViewParams | null>(null)
   const [gaia, setGaia] = useState<GaiaSource[] | null>(null)
   const [pick, setPick] = useState<[number, number] | null>(null)
   const pendingSrc = useRef<[number, number] | null>((() => {
@@ -338,21 +341,7 @@ export default function App() {
         {TARGETS.map((t) => (
           <button key={t.label} className="chip" onClick={() => go(t.q, t.fov)} title={t.hint}>{t.label}</button>
         ))}
-        <button className="chip chip-upload" onClick={() => setShowUpload((v) => !v)} aria-expanded={showUpload}>
-          Upload your own FITS images
-        </button>
       </div>
-      {showUpload && (
-        <UploadPanel onClose={() => setShowUpload(false)} onDone={(id, t) => {
-          setShowUpload(false)
-          setResolved(null)
-          setQuery('')
-          setFov(0.25)
-          setFovDraft(0.25)
-          setMode('epoch')
-          setParams({ ra: t ? t[0] : NaN, dec: t ? t[1] : NaN, fov: 0.25, dets, mode: 'epoch', release, deep, dataset: id })
-        }} />
-      )}
 
       {error && <div className="error" role="alert">{error}</div>}
 
@@ -411,7 +400,7 @@ export default function App() {
                   {frames.map((f, i) => (
                     <button key={i} className={`thumb ${i === index ? 'active' : ''}`} onClick={() => { setPlaying(false); setIndex(i) }}>
                       <span>{mode === 'epoch' ? f.label.replace('Epoch ', 'E') : mode === 'wavelength' ? f.label.replace(' µm', '') : i + 1}</span>
-                      <small>{mode === 'wavelength' && f.channel ? `D${f.channel.detector}·${f.channel.channel}` : f.date.slice(0, 10)}</small>
+                      <small>{mode === 'wavelength' && f.channel ? (f.channel.detector ? `D${f.channel.detector}·${f.channel.channel}` : `${f.nUsed} file${f.nUsed === 1 ? '' : 's'}`) : f.date.slice(0, 10)}</small>
                     </button>
                   ))}
                 </div>
@@ -452,12 +441,14 @@ export default function App() {
           {params?.dataset && (
             <div className="target">
               <div className="target-name">Your uploaded dataset</div>
-              {result?.dataset ? (
+              {result?.dataset?.files_used != null ? (
                 <>
                   <div className="small">
-                    {result.dataset.files_used} file{result.dataset.files_used === 1 ? '' : 's'} used · {result.dataset.pixel_scale_arcsec.toFixed(2)}″ pixels · units: {result.dataset.units}
+                    {result.dataset.files_used} file{result.dataset.files_used === 1 ? '' : 's'} used
+                    {result.dataset.pixel_scale_arcsec != null && ` · ${result.dataset.pixel_scale_arcsec.toFixed(2)}″ pixels`}
+                    {result.dataset.units && ` · units: ${result.dataset.units}`}
                   </div>
-                  {result.dataset.rejected.length > 0 && (
+                  {(result.dataset.rejected?.length ?? 0) > 0 && (
                     <details className="small"><summary className="warn">{result.dataset.rejected.length} file{result.dataset.rejected.length === 1 ? '' : 's'} skipped</summary>
                       <ul className="rejected">{result.dataset.rejected.map((r) => <li key={r.name}><span className="mono">{r.name}</span>: {r.reason}</li>)}</ul>
                     </details>
@@ -532,6 +523,24 @@ export default function App() {
               <button onClick={() => { setPlaying(false); setIndex((i) => (i - 1 + nFrames) % Math.max(1, nFrames)) }} aria-label="Previous frame">◀</button>
               <button onClick={() => { setPlaying(false); setIndex((i) => (i + 1) % Math.max(1, nFrames)) }} aria-label="Next frame">▶</button>
             </div>
+            <button className="download-btn export-btn" disabled={!grid?.n || !frame} onClick={async () => {
+              setPlaying(false)
+              const name = params?.dataset ? 'Uploaded dataset' : resolved?.name ?? 'Sky position'
+              const where = grid?.n ? `${formatRA(grid.ra)} ${formatDec(grid.dec)}` : ''
+              try {
+                await exportSideBySide({
+                  title: `${name} · ${where} · field ${(grid!.n * grid!.pixel_scale_arcsec / 60).toFixed(1)}′`,
+                  left: `SPHEREx ${frame!.label} · ${frame!.date}${frame!.wavelength ? ` · ${frame!.wavelength[0].toFixed(2)}–${frame!.wavelength[1].toFixed(2)} µm` : ''}`,
+                  right: `Reference: ${REF_SOURCES.find((r) => r.id === refSource)?.label ?? refSource}`,
+                  detail: 'SPHEREx Sky Motion Explorer by Team Barobax · spherex.peykan.ai · Data: NASA/IPAC IRSA, ESA Gaia DR3',
+                }, `spherex_${name.replace(/[^A-Za-z0-9]+/g, '_')}_${frame!.label.replace(/[^A-Za-z0-9]+/g, '_')}.png`)
+              } catch (e) {
+                setError(`Export failed: ${(e as Error).message}`)
+              }
+            }}>
+              <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1v9M4 6.5 8 10.5 12 6.5M2 13.5h12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /></svg>
+              Export image (both panels)
+            </button>
             <label>Blink interval {speed} ms
               <input type="range" min={100} max={2000} step={50} value={speed} onChange={(e) => setSpeed(+e.target.value)} />
             </label>
@@ -554,8 +563,17 @@ export default function App() {
             <p className="muted small">Brown dwarfs are brightest in D5–D6. Fewer detectors load faster.</p>
           </fieldset>}
 
-          {!params?.dataset && <fieldset>
+          <fieldset>
             <legend>Data</legend>
+            {params?.dataset ? (
+              <>
+                <p className="small data-note">Showing your uploaded dataset.</p>
+                <button onClick={() => {
+                  setParams(archiveParams.current)
+                  if (archiveParams.current) { setFov(archiveParams.current.fov); setFovDraft(archiveParams.current.fov) }
+                }}>{archiveParams.current ? 'Back to the SPHEREx archive' : 'Clear dataset'}</button>
+              </>
+            ) : (<>
             <label>Data release
               <select value={release} onChange={(e) => setRelease(e.target.value)}>
                 <option value="auto">Newest{releases?.auto.length ? ` (${releases.auto.map((r) => r.toUpperCase()).join(' + ')})` : ''}</option>
@@ -572,7 +590,24 @@ export default function App() {
             <p className="muted small" aria-live="polite">
               {refreshNote ?? 'New releases appear in the list automatically. "Newest" uses the latest data and quick release.'}
             </p>
-          </fieldset>}
+            </>)}
+            <div className="upload-entry">
+              {!showUpload ? (
+                <button className="upload-open" onClick={() => setShowUpload(true)}>Upload your own FITS images</button>
+              ) : (
+                <UploadPanel onClose={() => setShowUpload(false)} onDone={(id, t) => {
+                  if (!params?.dataset) archiveParams.current = params
+                  setShowUpload(false)
+                  setResolved(null)
+                  setQuery('')
+                  setFov(0.25)
+                  setFovDraft(0.25)
+                  setMode('epoch')
+                  setParams({ ra: t ? t[0] : NaN, dec: t ? t[1] : NaN, fov: 0.25, dets, mode: 'epoch', release, deep, dataset: id })
+                }} />
+              )}
+            </div>
+          </fieldset>
 
           <fieldset>
             <legend>Field of view</legend>

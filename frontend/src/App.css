@@ -170,7 +170,6 @@ footer { margin-top: 28px; padding-top: 12px; border-top: 1px solid var(--border
 .controls select { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); }
 
 /* Uploads */
-.chip-upload { border-style: dashed; color: var(--accent); }
 .upload-panel { margin: 0 0 16px; padding: 12px 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-1); }
 .upload-head { display: flex; justify-content: space-between; align-items: baseline; }
 .upload-head h2 { margin: 0 0 6px; font-size: 1.05rem; }
@@ -190,3 +189,13 @@ footer { margin-top: 28px; padding-top: 12px; border-top: 1px solid var(--border
 .up-uploading .up-status { color: var(--accent); }
 .rejected { margin: 4px 0 0; padding-left: 16px; }
 .hidden-note { margin: 0; text-align: center; }
+
+/* Upload form inside the sidebar's Data box */
+.upload-entry { border-top: 1px solid var(--border); padding-top: 10px; }
+.upload-open { width: 100%; border-style: dashed; color: var(--accent); }
+.controls .upload-panel { margin: 0; padding: 0; border: 0; background: none; }
+.controls .upload-row { grid-template-columns: minmax(0, 1fr); }
+.controls .upload-list li { grid-template-columns: minmax(0, 1fr) auto; }
+.controls .upload-list .up-status { grid-column: 1 / -1; font-size: 0.78rem; }
+.data-note { margin: 0; }
+.export-btn { width: 100%; justify-content: center; }

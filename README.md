@@ -72,6 +72,8 @@ motion. Barnard's Star has moved 4.5′ since 2000 and would otherwise be off-fr
 - **Data release choice** (sidebar, Data box): "Newest" (latest data release + quick release, the
   default), any single release found in the archive (`&release=dr1`), and optional Deep Field
   collections (`&deep=1`). Links that name a release keep showing the same data after new releases.
+- **Export image**: one PNG with the current blink frame (with overlays) and the reference panel side
+  by side, captioned with target, frame, date, wavelength and credits.
 - **Check for new data**: searches the archive again for the current view (at most once an hour per
   view) and reports how many new exposures were found; cached results for that view are cleared.
 - Shareable URLs: `?ra=133.788&dec=-7.242&fov=0.12&dets=5,6&mode=epoch`; add `&src=RA,Dec` to open a
