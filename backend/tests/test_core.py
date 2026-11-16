@@ -177,15 +177,6 @@ def test_upload_standard_rejects_with_reason(raw, reason):
         read_upload(raw, "x.fits")
 
 
-def test_backend_generation_matches_worker_config():
-    import pathlib
-    import re
-    from app import config
-    wrangler = (pathlib.Path(__file__).resolve().parents[2] / "worker" / "wrangler.jsonc").read_text(encoding="utf-8")
-    gen = re.search(r'"CONTAINER_GEN":\s*"(\d+)"', wrangler).group(1)
-    assert config.BACKEND_GEN == gen, "bump BACKEND_GEN in backend/app/config.py together with CONTAINER_GEN"
-
-
 def _synthetic_mover_job(n=81, scale=6.15, years=(2025.3, 2025.8, 2026.3, 2026.8, 2027.3), v_px_yr=1.0,
                          mover_flux=300.0, skip_mover=(), extra_stars=None, n_stars=15):
     import numpy as np
@@ -362,62 +353,17 @@ def test_saturated_mover_without_gaia_is_doubtful(monkeypatch):
     assert len(ms) == 1 and ms[0]["status"] == "doubtful" and ms[0]["reason"] == "saturated"
 
 
-def test_result_versions_match_worker_config():
-    import json
-    import pathlib
-    import re
-    from app import config
-    wrangler = (pathlib.Path(__file__).resolve().parents[2] / "worker" / "wrangler.jsonc").read_text(encoding="utf-8")
-    worker = json.loads(re.search(r'"RESULT_VERSIONS":\s*(\{[^}]*\})', wrangler).group(1))
-    assert worker == config.RESULT_VERSIONS, "keep RESULT_VERSIONS in backend/app/config.py and worker/wrangler.jsonc equal"
-
-
-def test_store_splits_and_reassembles(monkeypatch):
-    import httpx
-    from app import config, store
-    objects = {}
-
-    def handler(req: httpx.Request):
-        name = req.url.path.split("/api/_store/")[1]
-        if req.method == "PUT":
-            objects[name] = req.content
-            return httpx.Response(200)
-        return httpx.Response(200, content=objects[name]) if name in objects else httpx.Response(404)
-
-    monkeypatch.setattr(config, "STORE_BASE", "https://x/api/_store/")
-    monkeypatch.setattr(config, "IRSA_PROXY_KEY", "k")
-    monkeypatch.setattr(store, "_client", httpx.Client(transport=httpx.MockTransport(handler)))
-    monkeypatch.setattr(store, "CHUNK_BYTES", 1000)
-    data = bytes(range(256)) * 10  # 2560 bytes -> 3 parts
-    assert store.put("jobs/abc.npz", data)
-    assert sorted(objects) == ["jobs/abc.npz.0", "jobs/abc.npz.1", "jobs/abc.npz.2", "jobs/abc.npz.meta"]
-    assert store.get("jobs/abc.npz") == data
-    assert store.get("jobs/missing.json") is None
-    objects["jobs/abc.npz.1"] = b"x" * 1000  # an overwrite caught half way is never returned
-    assert store.get("jobs/abc.npz") is None
-
-
-def test_finished_job_survives_a_new_container(monkeypatch, tmp_path):
-    # A job saved by one container is restored by the next one (empty disk) from the shared store.
-    import time
+def test_finished_job_is_restored_from_the_disk_cache(monkeypatch, tmp_path):
+    # A finished job is saved to disk and loaded again (e.g. after a server restart).
     import numpy as np
-    from app import config, jobs, store
-    saved = {}
-    monkeypatch.setattr(store, "put", lambda name, data: saved.__setitem__(name, data) or True)
-    monkeypatch.setattr(store, "get", lambda name: saved.get(name))
-    monkeypatch.setattr(config, "CACHE_DIR", tmp_path / "a")
+    from app import config, jobs
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path)
     job = jobs.Job("k1", 10.0, 20.0, 0.1, [6], ["spherex_dr1"], status="done", pixel_scale=6.15, n=2, total=2,
                    epochs=[{"index": 0, "decimal_year": 2025.5}], metas=[{"epoch": 0}, {"epoch": 0}])
     job.images = [np.ones((5, 5), np.float32)] * 2
     job.variances = [np.ones((5, 5), np.float32)] * 2
     job.contams = [None, None]
     jobs._save_cached(job)
-    for _ in range(100):  # the upload runs in the background
-        if "jobs/k1.json" in saved:
-            break
-        time.sleep(0.02)
-    assert set(saved) == {"jobs/k1.npz", "jobs/k1.json"}
-    monkeypatch.setattr(config, "CACHE_DIR", tmp_path / "b")  # the new container's empty disk
     back = jobs._restore("k1")
     assert back and back.status == "done" and len(back.images) == 2 and back.pixel_scale == 6.15
 
@@ -511,3 +457,47 @@ def test_free_slot_goes_to_the_view_being_watched():
             break
         time.sleep(0.05)
     assert order == ["new", "gave up old"]
+
+
+def _upload_client(monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+    from app import config, main, uploads
+    monkeypatch.setattr(config, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(uploads, "create_limit", uploads.RateLimit(100))
+    monkeypatch.setattr(uploads, "file_limit", uploads.RateLimit(100))
+    return TestClient(main.app)
+
+
+def test_upload_stores_a_fits_file_and_the_reader_finds_it(monkeypatch, tmp_path):
+    from app import uploads
+    c = _upload_client(monkeypatch, tmp_path)
+    r = c.post("/api/datasets")
+    assert r.status_code == 200 and r.json()["limits"]["maxFiles"] == 50
+    ds = r.json()["id"]
+    raw = _upload_fits()
+    r = c.put(f"/api/datasets/{ds}/files/a.fits", content=raw)
+    assert r.status_code == 200 and r.json() == {"ok": True, "files": 1, "bytes": len(raw)}
+    assert uploads.manifest(ds)["files"] == [{"name": "a.fits", "bytes": len(raw)}]
+    assert uploads.read_upload(uploads.fetch(ds, "files/a.fits"), "a.fits")["shape"]
+
+
+def test_upload_rejects_bad_files_and_limits(monkeypatch, tmp_path):
+    from app import config, uploads
+    c = _upload_client(monkeypatch, tmp_path)
+    ds = c.post("/api/datasets").json()["id"]
+    assert c.put(f"/api/datasets/{ds}/files/a.txt", content=b"SIMPLE  = T").status_code == 400      # wrong extension
+    assert c.put(f"/api/datasets/{ds}/files/a.fits", content=b"hello world").status_code == 415      # not FITS
+    assert c.put(f"/api/datasets/{'0' * 32}/files/a.fits", content=_upload_fits()).status_code == 404  # unknown
+    monkeypatch.setattr(config, "UPLOAD_MAX_FILE_BYTES", 100)
+    r = c.put(f"/api/datasets/{ds}/files/b.fits", content=_upload_fits())
+    assert r.status_code == 413 and "MB" in r.json()["error"]
+    assert uploads.manifest(ds)["files"] == []                                   # nothing half-stored
+    assert not [p for p in (tmp_path / ds / "files").iterdir()]
+
+
+def test_upload_rate_limit(monkeypatch, tmp_path):
+    from app import uploads
+    c = _upload_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(uploads, "create_limit", uploads.RateLimit(2))
+    codes = [c.post("/api/datasets").status_code for _ in range(3)]
+    assert codes == [200, 200, 429]

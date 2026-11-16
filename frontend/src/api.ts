@@ -1,5 +1,5 @@
-// Typed client for the FastAPI backend. In dev, Vite proxies /api to localhost:8000;
-// in production, the Cloudflare Worker routes /api to the container.
+// Typed client for the FastAPI backend. In development, Vite proxies /api to the backend
+// (localhost:8000, or API_PROXY when set).
 
 export interface Epoch {
   index: number

@@ -11,7 +11,7 @@ interface Props {
 type FileState = { name: string; size: number; status: 'waiting' | 'uploading' | 'done' | 'error'; error?: string }
 
 const MB = 1000 * 1000
-const MAX_FILE = 100 * MB // per file; Cloudflare's request cap on this plan
+const MAX_FILE = 100 * MB // per file (the backend enforces the same limit)
 const OK_NAME = /\.(fits|fit|fts)(\.gz)?$/i
 
 export function UploadPanel({ onDone, onClose }: Props) {

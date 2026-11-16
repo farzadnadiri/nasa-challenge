@@ -9,16 +9,24 @@ Standard (also in README and shown in the app):
     (inverse variance); a bad-pixel extension MASK, FLAGS or DQ (non-zero = bad); WAVELEN (micron)
     or FILTER; BUNIT for the flux unit.
   * Limits: up to 50 files, 100 MB each, 1 GB per dataset, images up to 6000 x 6000 pixels.
+
+Storage: <UPLOAD_DIR>/<id>/manifest.json and <UPLOAD_DIR>/<id>/files/<name>. Anyone may upload within
+the limits; every dataset gets an unguessable 128-bit id, so it is only visible to people who have
+its link, and it is deleted after UPLOAD_KEEP_DAYS.
 """
 from __future__ import annotations
 
 import gzip
 import io
+import json
 import re
+import secrets
+import shutil
+import threading
 import time
 import warnings
+from collections import defaultdict, deque
 
-import httpx
 import numpy as np
 from astropy.io import fits
 from astropy.time import Time
@@ -37,7 +45,8 @@ SIGMA_NAMES = ("ERR", "ERROR", "SIGMA", "UNCERT")
 IVAR_NAMES = ("WEIGHT", "WHT", "IVAR")
 MASK_NAMES = ("MASK", "FLAGS", "DQ", "BPM")
 
-_client = httpx.Client(timeout=120, follow_redirects=True, headers=config.IRSA_HEADERS)
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+EXT_RE = re.compile(r"\.(fits|fit|fts)(\.gz)?$", re.IGNORECASE)
 
 
 class UploadError(ValueError):
@@ -140,18 +149,141 @@ def read_upload(raw: bytes, name: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------- storage
+
+class UploadRejected(Exception):
+    """An upload request refused before or while storing (HTTP status + message for the user)."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status, self.message = status, message
+
+
+class RateLimit:
+    """At most `per_min` calls per key (client address) in any 60 s."""
+
+    def __init__(self, per_min: int):
+        self.per_min = per_min
+        self.hits: dict[str, deque] = defaultdict(deque)
+        self.lock = threading.Lock()
+
+    def allow(self, key: str) -> bool:
+        now = time.time()
+        with self.lock:
+            q = self.hits[key]
+            while q and now - q[0] > 60:
+                q.popleft()
+            if len(q) >= self.per_min:
+                return False
+            q.append(now)
+            return True
+
+
+create_limit = RateLimit(config.UPLOAD_CREATE_PER_MIN)
+file_limit = RateLimit(config.UPLOAD_FILES_PER_MIN)
+_manifest_lock = threading.Lock()
+
+
+def limits() -> dict:
+    return {"maxFiles": config.UPLOAD_MAX_FILES, "maxFileBytes": config.UPLOAD_MAX_FILE_BYTES,
+            "maxDatasetBytes": config.UPLOAD_MAX_DATASET_BYTES, "keepDays": config.UPLOAD_KEEP_DAYS}
+
+
+def _dataset_dir(dataset: str):
+    if not DATASET_ID_RE.match(dataset):
+        raise UploadError("invalid dataset id")
+    return config.UPLOAD_DIR / dataset
+
+
+def _write_manifest(dataset: str, m: dict):
+    path = _dataset_dir(dataset) / "manifest.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(m))
+    tmp.replace(path)  # atomic: readers never see half a manifest
+
+
+def purge_expired():
+    """Delete datasets older than UPLOAD_KEEP_DAYS."""
+    if not config.UPLOAD_DIR.exists():
+        return
+    cutoff = time.time() - config.UPLOAD_KEEP_DAYS * 86400
+    for d in config.UPLOAD_DIR.iterdir():
+        if d.is_dir() and DATASET_ID_RE.match(d.name) and d.stat().st_mtime < cutoff:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def create_dataset() -> dict:
+    purge_expired()
+    dataset = secrets.token_hex(16)
+    (config.UPLOAD_DIR / dataset / "files").mkdir(parents=True)
+    _write_manifest(dataset, {"created": time.time() * 1000, "bytes": 0, "files": []})
+    return {"id": dataset, "limits": limits()}
+
+
+async def store_file(dataset: str, name: str, content_length: str | None, chunks) -> dict:
+    """Stream one uploaded file to disk (never held in memory), within the limits, then check
+    that it really is FITS. `chunks` is the request body as an async iterator of bytes."""
+    if not DATASET_ID_RE.match(dataset):
+        raise UploadRejected(404, "Unknown dataset.")
+    if not NAME_RE.match(name) or not EXT_RE.search(name):
+        raise UploadRejected(400, "File names may use letters, digits, dot, dash and underscore, and must end in "
+                                  ".fits, .fit or .fts (optionally .gz).")
+    try:
+        length = int(content_length or "")
+    except ValueError:
+        raise UploadRejected(411, "Content-Length is required.")
+    max_file = config.UPLOAD_MAX_FILE_BYTES
+    if length > max_file:
+        raise UploadRejected(413, f"Files are limited to {max_file / 1e6:.0f} MB.")
+    try:
+        m = manifest(dataset)
+    except UploadError:
+        raise UploadRejected(404, "Unknown or expired dataset.")
+    others = [f for f in m["files"] if f["name"] != name]
+    if len(others) >= config.UPLOAD_MAX_FILES:
+        raise UploadRejected(413, f"A dataset holds at most {config.UPLOAD_MAX_FILES} files.")
+    used = sum(f["bytes"] for f in others)
+    if used + length > config.UPLOAD_MAX_DATASET_BYTES:
+        raise UploadRejected(413, f"A dataset holds at most {config.UPLOAD_MAX_DATASET_BYTES / 1e9:.0f} GB.")
+
+    final = _dataset_dir(dataset) / "files" / name
+    tmp = final.with_name(f".{name}.{secrets.token_hex(4)}.part")
+    size, head = 0, b""
+    try:
+        with open(tmp, "wb") as out:
+            async for chunk in chunks:
+                size += len(chunk)
+                if size > max_file:
+                    raise UploadRejected(413, "File too large.")
+                if len(head) < 9:
+                    head += chunk[: 9 - len(head)]
+                out.write(chunk)
+        if size == 0:
+            raise UploadRejected(400, "Empty upload.")
+        if not (head == b"SIMPLE  =" or head[:2] == b"\x1f\x8b"):
+            raise UploadRejected(415, "Not a FITS file (it must start with SIMPLE =).")
+        tmp.replace(final)
+    finally:
+        tmp.unlink(missing_ok=True)
+    with _manifest_lock:  # two files of one dataset may finish at the same moment
+        m = manifest(dataset)
+        m["files"] = [f for f in m["files"] if f["name"] != name] + [{"name": name, "bytes": size}]
+        m["bytes"] = sum(f["bytes"] for f in m["files"])
+        _write_manifest(dataset, m)
+    return {"ok": True, "files": len(m["files"]), "bytes": m["bytes"]}
+
+
 def fetch(dataset: str, path: str) -> bytes:
-    """Read an uploaded object through the Worker's internal route (needs the shared proxy key)."""
-    r = _client.get(f"{config.UPLOAD_BASE}{dataset}/{path}")
-    if r.status_code != 200:
-        raise UploadError(f"could not read {path} (HTTP {r.status_code})")
-    return r.content
+    """An uploaded object: 'manifest.json' or 'files/<name>'."""
+    if path != "manifest.json" and not (path.startswith("files/") and NAME_RE.match(path[6:])):
+        raise UploadError(f"could not read {path}")
+    try:
+        return (_dataset_dir(dataset) / path).read_bytes()
+    except OSError:
+        raise UploadError(f"could not read {path} (not found)")
 
 
 def manifest(dataset: str) -> dict:
-    if not DATASET_ID_RE.match(dataset):
-        raise UploadError("invalid dataset id")
-    import json
     return json.loads(fetch(dataset, "manifest.json"))
 
 

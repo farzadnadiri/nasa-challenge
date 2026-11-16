@@ -4,6 +4,7 @@ import { defineConfig } from 'vite'
 export default defineConfig({
   plugins: [react()],
   server: {
-    proxy: { '/api': 'http://localhost:8000' },
+    // API_PROXY: where the backend runs (docker compose points it at the backend service)
+    proxy: { '/api': process.env.API_PROXY ?? 'http://localhost:8000' },
   },
 })

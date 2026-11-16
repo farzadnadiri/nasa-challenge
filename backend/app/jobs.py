@@ -18,7 +18,7 @@ import numpy as np
 from astropy.time import Time
 
 from . import config
-from . import store, uploads
+from . import uploads
 from .cutouts import clean_and_reproject, make_grid, process_exposure
 from .irsa import Exposure, UpstreamError, assign_epochs, query_exposures
 
@@ -108,8 +108,8 @@ _restore_locks: dict[str, threading.Lock] = {}
 
 
 def _restore(key: str) -> Job | None:
-    """A finished job from this container's disk or, after a deploy, from the shared store.
-    Called without the global lock: a download can take a few seconds."""
+    """A finished job from the disk cache. Called without the global lock: loading a large job
+    takes a moment."""
     with _restore_locks.setdefault(key, threading.Lock()):
         return _load_cached(key)
 
@@ -593,22 +593,11 @@ def _save_cached(job: Job):
         "planned": job.planned, "saved": time.time(),
     }))
 
-    # Copy to the shared store in the background (the npz first: the json marks it complete).
-    def share():
-        if store.put(f"jobs/{job.key}.npz", npzp.read_bytes()):
-            store.put(f"jobs/{job.key}.json", jp.read_bytes())
-    threading.Thread(target=share, daemon=True).start()
-
 
 def _load_cached(key: str) -> Job | None:
     jp, npzp = _paths(key)
     if not (jp.exists() and npzp.exists()):
-        meta = store.get(f"jobs/{key}.json")
-        arrays = store.get(f"jobs/{key}.npz") if meta else None
-        if not arrays:
-            return None
-        npzp.write_bytes(arrays)
-        jp.write_bytes(meta)
+        return None
     d = json.loads(jp.read_text())
     if time.time() - d["saved"] > config.CACHE_TTL_DAYS * 86400:
         return None

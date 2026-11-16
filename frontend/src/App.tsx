@@ -238,7 +238,7 @@ export default function App() {
         if (r.status !== 'done') setTimeout(tick, r.frames.length ? 2000 : 1000)
       } catch (e) {
         if ((e as Error).name === 'AbortError' || myPoll !== pollRef.current) return
-        // A container restart or a brief network error should not end the session.
+        // A server restart or a brief network error should not end the session.
         if (++failures <= 5) setTimeout(tick, 1500 * failures)
         else setError((e as Error).message)
       }

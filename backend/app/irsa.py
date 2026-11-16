@@ -47,7 +47,6 @@ def _tap_query(adql: str, retries: int = 3) -> Table:
                 config.IRSA_TAP,
                 data={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "votable", "QUERY": adql},
                 timeout=timeout,
-                headers=config.IRSA_HEADERS,
             )
             if r.status_code == 200:
                 return Table.read(io.BytesIO(r.content), format="votable", use_names_over_ids=True)
@@ -177,7 +176,7 @@ def _query_sia(ra: float, dec: float, detectors: list[int], collections: list[st
         r, last = None, ""
         for attempt in range(4):  # transient failures are retried with backoff
             try:
-                r = httpx.get(config.IRSA_SIA, params=params, headers=config.IRSA_HEADERS,
+                r = httpx.get(config.IRSA_SIA, params=params,
                               timeout=httpx.Timeout(connect=15, read=config.TAP_DEADLINE_S, write=15, pool=15))
                 if r.status_code < 500:
                     break

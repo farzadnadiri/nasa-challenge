@@ -5,11 +5,11 @@ import base64
 import threading
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from . import catwise, config, gaia, jobs
+from . import catwise, config, gaia, jobs, uploads
 from .cutouts import make_grid
 from .movers import find_movers
 from .uploads import UploadError
@@ -84,18 +84,15 @@ def _cut(img, n: int, off: int):
 
 
 def _cached_response(kind: str, body: dict, complete: bool) -> JSONResponse:
-    # The Cloudflare Worker stores responses in R2 only when X-Complete is true and X-Result-Version
-    # is the version it expects for this kind of result (so older code is never cached as newer).
-    headers = {"X-Complete": "true" if complete else "false", "X-Backend-Gen": config.BACKEND_GEN,
-               "X-Result-Version": config.RESULT_VERSIONS[kind],
+    # Finished results may be cached by the browser or any proxy in front; in-progress ones change on every poll.
+    headers = {"X-Complete": "true" if complete else "false",
                "Cache-Control": "public, max-age=86400" if complete else "no-store"}
     return JSONResponse(body, headers=headers)
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "pipeline_version": config.PIPELINE_VERSION,
-            "irsa_base": config.IRSA_BASE, "irsa_proxy_key_set": bool(config.IRSA_PROXY_KEY)}
+    return {"ok": True, "pipeline_version": config.PIPELINE_VERSION, "irsa_base": config.IRSA_BASE}
 
 
 @app.get("/api/diag")
@@ -112,7 +109,6 @@ def diag():
         "irsa_home": (config.IRSA_BASE, 20),
         "gaia": (config.GAIA_TAP.replace("/sync", "/availability"), 20),
         "sesame": (config.SESAME + "?R%20Dra", 20),
-        "irsa_http80": ("http://irsa.ipac.caltech.edu/", 20),
         "s3_bucket": ("https://nasa-irsa-spherex.s3.us-east-1.amazonaws.com/?list-type=2&max-keys=1&prefix=dr1/level2/", 20),
     }
     out = {"dns": {}}
@@ -129,6 +125,31 @@ def diag():
         except Exception as e:  # report the failure type, that is the point of this endpoint
             out[name] = {"error": f"{type(e).__name__}: {e}"[:200], "seconds": round(time.time() - t, 2)}
     return out
+
+
+# ---------------------------------------------------------------- uploads ("FITS + WCS v1")
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+@app.post("/api/datasets")
+def create_dataset(request: Request):
+    """Create an empty dataset; files are then added one by one with PUT."""
+    if not uploads.create_limit.allow(_client_ip(request)):
+        return JSONResponse({"error": "Too many new datasets from your address; wait a minute."}, 429)
+    return uploads.create_dataset()
+
+
+@app.put("/api/datasets/{dataset}/files/{name}")
+async def put_dataset_file(dataset: str, name: str, request: Request):
+    """Add one FITS file (raw request body) to a dataset."""
+    if not uploads.file_limit.allow(_client_ip(request)):
+        return JSONResponse({"error": "Too many uploads from your address; wait a minute."}, 429)
+    try:
+        return await uploads.store_file(dataset, name, request.headers.get("content-length"), request.stream())
+    except uploads.UploadRejected as e:
+        return JSONResponse({"error": e.message}, e.status)
 
 
 @app.get("/api/resolve")
@@ -187,7 +208,7 @@ def frames(
             for f in jobs.exposure_frames(job, wl_min, wl_max):
                 body["frames"].append({"meta": f["meta"], "image": _b64(_cut(f["image"], n, off)),
                                        "contam": _b64u8(_cut(f["contam"], n, off))})
-    # A refresh request is never cached; the Worker clears this view's stored results instead.
+    # A refresh request is never cached.
     return _cached_response("frames", body, complete and not refresh)
 
 

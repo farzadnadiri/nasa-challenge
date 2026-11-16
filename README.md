@@ -1,176 +1,144 @@
 # SPHEREx Sky Motion Explorer
 
-A public web tool that blinks NASA SPHEREx infrared images of any patch of sky so anyone can
-spot objects that move (nearby stars, brown dwarfs, asteroids) or change brightness (variable stars).
-Built for the NASA "SPHEREx Sky Motion Explorer" challenge (see [docs/](docs/)).
+A web tool that blinks NASA SPHEREx infrared images of any patch of sky, so anyone can spot objects
+that move (nearby stars, brown dwarfs) or change brightness (variable stars), and that automatically
+flags moving sources Gaia has never catalogued.
 
-**Live:** https://spherex.peykan.ai
+Built by Team Barobax for the NASA Space Apps Challenge 2026 ("SPHEREx Sky Motion Explorer").
+**Live demo:** https://spherex.peykan.ai
 
-## Why it works the way it does
+![Barnard's Star in SPHEREx: the blink view beside an unWISE reference image](assets/screenshot.png)
 
-SPHEREx is not a normal imager. Each detector sits behind a linear variable filter, so every
-exposure sees each part of the sky at a *different wavelength*. Playing raw exposures in time
-order would mostly show colour changes, not motion. The tool therefore:
+## What it does
 
-1. Finds every SPHEREx spectral image that covers the position (IRSA SIA, with TAP as fallback;
-   queried live, so new weekly data appears automatically). New data releases are picked up too:
-   the backend lists the public S3 bucket's release folders once a day and searches the newest
-   data release and quick release (set `SIA_COLLECTIONS` to pin them).
-2. Groups exposures into **epochs**: SPHEREx revisits each point every ~6 months. Epochs with
-   very few exposures are flagged "shallow" and skipped by default.
-3. For each exposure: reads only the needed IMAGE and FLAGS rows plus the wavelength table
-   straight from the public S3 bucket (HTTP range requests), subtracts the local sky, masks bad
-   pixels, and reprojects onto one north-up grid.
-4. Stacks each epoch, weighted by each frame's sky noise, per chosen detector (wavelength band).
-5. The browser blinks the epochs with one shared stretch, so brightness changes are real.
+- **Search** by name (CDS Sesame, carried to today with the star's proper motion) or coordinates.
+- **Blink** through survey visits ("epochs", one stack per ~6-month visit), single exposures, or all
+  102 SPHEREx wavelengths as a spectrum movie. One brightness scale across all frames, so changes are real.
+- **Image arithmetic:** each frame minus the average, or add / subtract any chosen sets of visits.
+- **Overlays:** Gaia DR3 and CatWISE2020 sources moved to each frame's date (SIMBAD names on hover),
+  and the SPHEREx contamination flags (ghosts, halos, streaks, crosstalk) as a pixel map.
+- **Click a star** for its spectrum per visit and a brightness curve compared at matched wavelengths
+  (so different wavelength sampling is not mistaken for variability). CSV export.
+- **Moving-source detection** that labels each mover *known*, *candidate*, *doubtful* or *unchecked*.
+- **Reference panel:** unWISE, Legacy Survey, a stack of all SPHEREx visits, or the interactive Aladin Lite atlas.
+- **Your own data:** upload FITS images with a WCS ("FITS + WCS v1", below) and explore them the same way.
+- Always current: new SPHEREx releases are discovered automatically; "Check for new data" searches again.
+- Shareable links, side-by-side PNG export, and an embed mode (`&embed=1`).
 
-Saturated stars (R Dra, RW Aur, Barnard's Star) have masked cores. Their brightness is measured
-in a fixed ring around the core, and the brightness chart compares epochs at matched wavelengths
-so different wavelength sampling is not mistaken for variability.
+## How it works
 
-## Performance
+SPHEREx is not an ordinary imager: each detector sits behind a linear variable filter, so every
+exposure sees each part of the sky at a *different wavelength*. Playing raw exposures in time order
+would mostly show colour changes, not motion. So the backend:
 
-A new position loads in about 10–30 s (first frames after ~5 s); results are then cached on
-the container and in R2. Most of the speed comes from reading S3 directly: IRSA's cutout service
-returns ~4 MB per exposure (mostly an unused PSF table) and takes ~3–5 s to build each one, while
-the S3 range reads fetch under 1 MB in a few small requests. The IRSA cutout service remains as
-a fallback.
+1. **Searches** IRSA (SIA, with TAP as fallback) for every spectral image covering the position, in the
+   newest data and quick releases, found by listing the public S3 bucket.
+2. **Reads only what it needs** straight from the public S3 bucket with HTTP range requests: the IMAGE
+   rows, the RICE-compressed FLAGS rows (decoded locally) and the wavelength table, under 1 MB per
+   exposure instead of a ~4 MB cutout, about **24× faster** than IRSA's cutout service.
+3. **Cleans and aligns** each exposure: masks bad pixels, removes the local sky (zodiacal light differs
+   between visits), reprojects onto one north-up grid at the native 6.15″ pixel.
+4. **Groups exposures into epochs** (gaps over 20 days split visits; long visits near the ecliptic poles
+   are cut into 30-day windows) and stacks each epoch with inverse-variance weights.
 
-## Deployment notes
+### Moving-source detection
 
-- IRSA refuses connections from Cloudflare's container network, so the container reaches IRSA
-  through the Worker's `/api/_irsa/` proxy. It only allows SIA, TAP and SPHEREx image paths and
-  requires the `IRSA_PROXY_KEY` secret. S3, Gaia and CDS are reached directly.
-- Containers roll over slowly. Bump `CONTAINER_GEN` in `worker/wrangler.jsonc` together with
-  `BACKEND_GEN` in `backend/app/config.py` (a test checks they match) whenever the
-  backend changes, so requests go to a fresh container running the new image.
-- A new container generation does not empty the caches. API responses in R2 are keyed by
-  `RESULT_VERSIONS` (one version per kind of result, in both `backend/app/config.py` and
-  `worker/wrangler.jsonc`; a test checks they match): bump only the kind whose output changed,
-  e.g. `movers` after a detection change. Finished image stacks are kept in R2 under `store/`
-  (through the Worker's internal `/api/_store/` route, same secret as the IRSA proxy), so a new
-  container loads a view in seconds instead of rebuilding it from the archive. Changing
-  `PIPELINE_VERSION` (image processing) renews everything.
-- `GET /api/health` reports the pipeline version and whether the proxy is configured;
-  `GET /api/diag` times each upstream from inside the container.
+1. Detect sources in every epoch stack (SEP) with windowed sub-pixel centroids, only where that epoch
+   has real coverage, so a star cut by an image edge never gets a false centroid.
+2. Link detections across epochs: any epoch can start a track, straight-line motions through every
+   brightness-consistent neighbour are tried, and each detection is assigned to one track only.
+3. Fill missed epochs with forced measurements at the predicted position.
+4. **Calibrate the position errors on the field itself.** Almost every source is still, so each track's
+   χ² should sit at the median expected for its degrees of freedom; a systematic floor and a
+   signal-to-noise term are fitted separately for bright and faint stars.
+5. Keep motions that are ≥ 5σ and ≥ 0.3″/yr over 3+ epochs, seen in most epochs that cover them, and
+   still ≥ 3σ when any single point is left out (one bad centroid cannot fake a motion).
+6. Compare with Gaia DR3 carried to each epoch by full motion vector: **known** (a Gaia star moves the
+   same way), **candidate** (no Gaia star on the track), **doubtful** (saturated, or a Gaia star sits on
+   the track but moves differently) or **unchecked** (Gaia unreachable).
 
-Exposure mode plays single exposures in time order instead, for fast solar-system objects.
+On the challenge targets it recovers Barnard's Star (10.3″/yr) and Epsilon Indi B (4.4″/yr) as known,
+flags the cold brown dwarf WISE 0855, which Gaia cannot see, as a candidate (7.5″/yr), and reports no
+false movers for the variable stars RW Aur and R Dra.
 
-Object names resolve through CDS Sesame and are carried from J2000 to 2026.0 with their proper
-motion. Barnard's Star has moved 4.5′ since 2000 and would otherwise be off-frame.
+### Engineering notes
 
-## Features
+- **One job per detector**, combined per view: adding a detector processes only that detector, and
+  removing one (or returning to a combination seen before) needs no work at all.
+- **Priority queue:** a free processing slot goes to the view someone is looking at; queued work nobody
+  asks about any more gives up its place.
+- **Progressive loading:** frames appear and sharpen while exposures are still arriving; finished image
+  stacks are cached on disk.
+- Saturated stars have masked cores: their brightness is measured in a fixed ring around the core.
+- 44 backend tests, including synthetic star fields for the mover search (crowded fields, image edges,
+  a fake motion on a still Gaia star, a mover missing from one epoch).
 
-- Name or coordinate search (decimal, `hh:mm:ss ±dd:mm:ss`, `08h55m10.8s -07d14m42s`)
-- Presets for the five challenge targets
-- Three animations: **epochs** (one stack per survey visit), **exposures** (time order, for fast
-  solar-system objects) and **wavelength** (one stack per SPHEREx channel, 17 per detector, so the
-  102 bands play as a spectrum); blink speed and frame stepping (Space, ←, →)
-- Detector (wavelength) selection D1–D6, field of view up to 15′, viewer sized to the screen
-- Difference imaging (frame minus the mean of all frames) and **A − B** (any frame minus another:
-  two epochs to see what moved, or two wavelength channels for a colour image)
-- Gaia DR3 overlay with each star moved to the frame's date (fast movers in red; brightest 80 shown)
-- **Moving-source search** (Display box, "Find moving sources"): sources are detected in every deep
-  epoch stack (only where that epoch has real coverage), linked across epochs (any epoch can start a
-  track; each detection is used once), completed with forced measurements, and fitted with a straight
-  line. Position errors are calibrated on the still stars of the field (a systematic floor and a
-  signal-to-noise term, fitted separately). Listed when the motion is at least 5σ and 0.3″/yr over 3+
-  epochs, seen in at least 60% of the epochs covering it with 3+ real detections, and still 3σ when
-  any one point is left out. Then compared with Gaia DR3 (down to 20,000 stars) by full motion vector:
-  **candidate** (no Gaia star on the track), **known** (a Gaia star moves the same way), **doubtful**
-  (saturated, or a Gaia star sits on the track but moves differently) or **unchecked** (Gaia unreachable;
-  not cached, so the next request checks again)
-- Reference panel beside the blink view: unWISE or Legacy Survey cutouts, a stack of all SPHEREx epochs,
-  or **CDS Aladin Lite** (interactive; AllWISE, 2MASS and DSS imagery from IRSA's HiPS mirrors, Gaia DR3
-  and CatWISE2020 overlays). `?ref=aladin` opens it directly. Aladin is loaded only when chosen.
-- Per-frame metadata (date, wavelength range, exposures used, contamination flags) and an
-  **exposure metadata table** for every exposure, with CSV export
-- Click a source for a quick-look spectrum per epoch and a per-epoch brightness plot, plus CSV export
-- **Data release choice** (sidebar, Data box): "Newest" (latest data release + quick release, the
-  default), any single release found in the archive (`&release=dr1`), and optional Deep Field
-  collections (`&deep=1`). Links that name a release keep showing the same data after new releases.
-- **Export image**: one PNG with the current blink frame (with overlays) and the reference panel side
-  by side, captioned with target, frame, date, wavelength and credits.
-- **Check for new data**: searches the archive again for the current view (at most once an hour per
-  view) and reports how many new exposures were found; cached results for that view are cleared.
-- Shareable URLs: `?ra=133.788&dec=-7.242&fov=0.12&dets=5,6&mode=epoch`; add `&src=RA,Dec` to open a
-  clicked source with its spectrum, and `&ref=aladin` (or `unwise`, `ls`, `spherex`) for the reference panel
+## Tech stack
 
-## Your own images (upload standard "FITS + WCS v1")
+- **Backend:** Python 3.11, FastAPI, Astropy, reproject, NumPy, SciPy, SEP
+- **Frontend:** React, TypeScript, Vite, HTML canvas, Aladin Lite
+- **Data:** NASA SPHEREx via NASA/IPAC IRSA and the public SPHEREx S3 bucket; ESA Gaia DR3; CatWISE2020
+  and Gaia via VizieR; CDS Sesame and SIMBAD; unWISE / Legacy Survey imagery
 
-Anyone can upload their own images ("Upload your own FITS images" under the search box); they are
-checked, aligned, stacked and blinked exactly like SPHEREx data, with the same overlays and charts.
+## Run it
+
+**With Docker** (backend and frontend together):
+
+```bash
+docker compose up
+# open http://localhost:5173
+```
+
+**Without Docker** (Python 3.11 and Node 20.19+ or 22.12+):
+
+```bash
+python -m venv .venv
+.venv/bin/pip install -r backend/requirements.txt         # Windows: .venv\Scripts\pip
+cd backend && ../.venv/bin/uvicorn app.main:app --port 8000
+
+# in another terminal
+cd frontend && npm install && npm run dev                 # http://localhost:5173, proxies /api to :8000
+```
+
+A new position takes about 10–30 s per detector the first time (the archive search can take longer);
+after that it is cached in `backend/.cache`.
+
+**Tests:** `cd backend && ../.venv/bin/python -m pytest tests`
+
+## Upload your own images ("FITS + WCS v1")
 
 - One FITS file per exposure (`.fits`, `.fit`, `.fts`, optionally `.gz`).
 - **Required:** a 2-D image (first image HDU, or an extension named `IMAGE`/`SCI`), a celestial WCS
   (RA/Dec), and an observation time (`MJD-OBS`, `MJD-AVG` or `DATE-OBS` in UTC).
 - **Optional:** noise as `VARIANCE`, `ERR` (1σ) or `WEIGHT` (inverse variance); bad pixels as `MASK`,
   `FLAGS` or `DQ` (non-zero = bad); `WAVELEN` (µm) or `FILTER`; `BUNIT`.
-- **Limits:** 50 files, 100 MB each (Cloudflare's request cap on this plan), 1 GB per dataset, images up
-  to 6000 × 6000; per visitor, 3 new datasets and 60 files per minute.
-- **Privacy:** each dataset gets an unguessable private link (`?dataset=<id>`); everything in the
-  storage bucket is deleted automatically after 7 days (R2 lifecycle rule).
-- Files that break the standard are skipped and listed with the reason; the target defaults to the
-  median centre of the images, or can be given explicitly. Fluxes are reported in the files' own units.
-
-## Embedding
-
-Add `embed=1` to any view link to get just the blink viewer with a play button and a link back:
-
-```html
-<iframe src="https://spherex.peykan.ai/?q=WISE%20J085510.83-071442.5&ra=133.786245&dec=-7.244372&fov=0.120&dets=5,6&mode=epoch&embed=1"
-        width="480" height="520" style="border:0" title="SPHEREx view of WISE 0855"></iframe>
-```
-
-## Layout
-
-```
-backend/   FastAPI + astropy/reproject science service (Docker image)
-frontend/  React + Vite single-page app
-worker/    Cloudflare Worker: serves the SPA, routes /api to the container, caches results in R2
-docs/      Challenge brief and SPHEREx tutorial notebooks
-```
-
-## Run locally
-
-```bash
-# backend (Python 3.11)
-python -m venv .venv && .venv/Scripts/pip install -r backend/requirements.txt   # Windows path
-cd backend && ../.venv/Scripts/python -m uvicorn app.main:app --port 8000 --reload
-
-# frontend (Vite proxies /api to :8000)
-cd frontend && npm install && npm run dev
-```
-
-Tests: `cd backend && ../.venv/Scripts/python -m pytest tests`
-
-## Deploy (Cloudflare)
-
-Requires the Workers Paid plan (Containers) and Docker running locally for the image build.
-
-```bash
-cd worker
-npm install
-npx wrangler login
-npx wrangler r2 bucket create spherex-cache
-npx wrangler secret put IRSA_PROXY_KEY   # any long random string
-npm run deploy          # builds the frontend, builds and pushes the container, deploys the Worker
-python ../backend/prewarm.py https://spherex.peykan.ai   # fill the cache for the five targets
-```
+- **Limits:** 50 files, 100 MB each, 1 GB per dataset, images up to 6000 × 6000; per client, 3 new
+  datasets and 60 files per minute.
+- Each dataset gets an unguessable private link (`?dataset=<id>`) and is deleted after 7 days.
+- Files that break the standard are skipped and listed with the reason.
 
 ## API
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /api/resolve?q=` | Name or coordinates to position at the data epoch |
-| `GET /api/frames?ra&dec&fov&dets&mode&release&deep&refresh` | Starts or polls a job; `mode` = epoch, exposure or wavelength; `release` = auto or e.g. dr1; `refresh=1` searches again; frames as base64 float32 |
-| `POST /api/datasets`, `PUT /api/datasets/<id>/files/<name>` | Create a dataset, upload one FITS file (raw body) |
-| `GET /api/releases` | Releases found in the archive, and what "Newest" currently means |
-| `GET /api/exposures?ra&dec&fov&dets` | Metadata for every exposure (no pixels) |
+| `GET /api/resolve?q=` | Name or coordinates to a position at today's date |
+| `GET /api/frames?ra&dec&fov&dets&mode&release&deep&refresh` | Starts or polls a view; `mode` = epoch, exposure or wavelength; frames as base64 float32 |
+| `GET /api/movers?ra&dec&fov&dets&release&deep` | Moving sources with status, motion, significance and per-epoch positions (`debug=1` adds every track) |
 | `GET /api/photometry?ra&dec&fov&dets&x&y` | Aperture photometry at a grid pixel for every exposure |
-| `GET /api/gaia?ra&dec&radius` | Gaia DR3 sources (epoch 2016.0) |
-| `GET /api/movers?ra&dec&fov&dets&release&deep` | Moving sources with status, motion, significance and per-epoch positions; `debug=1` adds every track and the error model |
+| `GET /api/exposures?ra&dec&fov&dets` | Metadata for every exposure |
+| `GET /api/gaia?ra&dec&radius`, `GET /api/catwise?ra&dec&radius` | Catalogue sources for the overlays |
+| `GET /api/releases` | Releases found in the archive, and what "Newest" means |
+| `POST /api/datasets`, `PUT /api/datasets/<id>/files/<name>` | Create a dataset, upload one FITS file (raw body) |
 
-## Data credits
+## Layout
 
-NASA SPHEREx via NASA/IPAC Infrared Science Archive (IRSA); ESA Gaia DR3; CDS Sesame/SIMBAD.
+```
+backend/    FastAPI science service (app/), tests, Dockerfile
+frontend/   React + Vite single-page app
+assets/     README screenshot
+```
+
+## Credits
+
+NASA SPHEREx data via the NASA/IPAC Infrared Science Archive (IRSA); ESA Gaia DR3; CatWISE2020 (NASA
+WISE / NEOWISE); CDS Sesame, SIMBAD, VizieR and Aladin Lite; unWISE and Legacy Survey imagery.

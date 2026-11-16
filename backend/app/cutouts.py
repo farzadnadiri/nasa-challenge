@@ -20,7 +20,7 @@ from .irsa import Exposure
 logging.getLogger("astropy").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=FITSFixedWarning)
 
-_client = httpx.Client(timeout=120, follow_redirects=True, headers=config.IRSA_HEADERS,
+_client = httpx.Client(timeout=120, follow_redirects=True,
                        limits=httpx.Limits(max_connections=config.FETCH_WORKERS * 2))
 _s3 = httpx.Client(timeout=60, limits=httpx.Limits(max_connections=config.FETCH_WORKERS * 2,
                                                    max_keepalive_connections=config.FETCH_WORKERS * 2))
